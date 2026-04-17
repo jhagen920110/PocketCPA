@@ -1,0 +1,481 @@
+using System.Text;
+using System.Text.Json;
+using api.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
+
+namespace api.Services;
+
+public class MonthNotDeterminedException : Exception
+{
+    public MonthNotDeterminedException() : base("AI could not determine the month from the statement data.") { }
+}
+
+public class SpendingAnalyzerService
+{
+    private readonly HttpClient _httpClient;
+    private readonly AzureAiOptions _options;
+    private readonly ILogger<SpendingAnalyzerService> _logger;
+
+    private static readonly string[] SpendingCategories =
+    [
+        "Groceries", "Dining Out / Restaurants", "Transportation",
+        "Shopping / Retail", "Entertainment / Subscriptions", "Utilities / Bills",
+        "Healthcare / Medical", "Travel / Hotels", "Personal Care",
+        "Education", "Home / Maintenance", "Fees / Interest", "Cash / ATM", "Other"
+    ];
+
+    private static readonly string SystemPrompt = $$"""
+        You extract transactions from raw bank or credit-card statement text (Chase, American Express,
+        Bank of America, Capital One, Discover, Citi, Wells Fargo, etc.). Every issuer formats their
+        statements differently, so you must be flexible: look for rows that have a date, a merchant
+        description, and a dollar amount.
+
+        You DO NOT compute totals. You DO NOT group into categories. You simply return a flat list
+        of transactions. The backend will do all the math.
+
+        # Step 1: Find every transaction
+        A transaction row has: <date> <description> <amount>. Dates may be MM/DD, MM/DD/YY, MM/DD/YYYY,
+        or "Dec 18". Amounts are dollars and cents, possibly with thousands separators and an optional
+        leading "-". PDF extraction often removes spaces; the AMOUNT is the LAST decimal number on the row.
+
+        Examples (Chase):
+            "12/07     WAL-MART #1833 FREDERICKSBUR VA10.41"        → 12/07, "WAL-MART #1833 FREDERICKSBUR VA", 10.41
+            "12/18     LG ELECTRONICS USA INC ENGLEWOOD NJ-271.71"  → 12/18, "LG ELECTRONICS...", -271.71
+        Examples (Amex):
+            "12/15/25 TESLA SUPERCHARGER US 877-7983752 CA     $12.34" → 12/15/25, "TESLA SUPERCHARGER...", 12.34
+        Examples (BofA):
+            "12/19/2025 CHECKCARD 1218 WALMART GROCERY  -54.27" → 12/19/2025, "CHECKCARD 1218 WALMART GROCERY", -54.27
+
+        # Step 2: Classify and filter
+        For each transaction, decide:
+          - PURCHASE: a merchant charge (spending). Return the amount as POSITIVE.
+          - REFUND / RETURN / MERCHANT CREDIT: a negative amount clearly tied to a merchant
+            ("RETURN WAL-MART", "AMAZON.COM REFUND", "LG ELECTRONICS ... -271.71"). Return the amount
+            as NEGATIVE. Do NOT drop these — the backend will subtract them from that merchant's category.
+          - SKIP entirely (do not include in the output):
+              * Payments / autopay / "Thank You" payments
+              * Balance transfers, cash advances treated as payments
+              * Deposits, payroll, transfers from other accounts
+              * Rewards redemptions, cashback credits, interest PAID to you
+              * Statement summaries, running balances, section totals
+              * For CHECKING accounts: any POSITIVE amount is a deposit — SKIP.
+
+        # Step 3: Output
+        Return a flat `transactions` array. Each row has:
+          date:        the date as shown on the statement (keep original format)
+          merchant:    a SHORT, CLEAN brand name a human would recognize. Strip store numbers, city/state,
+                       processor prefixes ("TST*", "SQ *", "CHECKCARD"), and phone numbers. Examples:
+                         "WAL-MART #1833 FREDERICKSBUR VA"    → "Walmart"
+                         "TST* PARIS BAGUETTE - FAI FAIRFAX VA" → "Paris Baguette"
+                         "SQ *H MART PLANO Plano TX"          → "H Mart"
+                         "AIRBNB * HMP5MDDSQT AIRBNB.COM CA"  → "Airbnb"
+                         "OPENAI *CHATGPT SUBSCR OPENAI.COM CA" → "ChatGPT"
+                         "NTTA CSC - PLANO 972-818-6882 TX"   → "NTTA Tolls"
+                         "CHECKCARD 1218 WALMART GROCERY"     → "Walmart"
+          description: the original row text, unchanged (for reference).
+          amount:      dollars and cents. POSITIVE for purchases. NEGATIVE for refunds/returns.
+          category:    EXACTLY one of: {{string.Join(", ", SpendingCategories)}}
+
+        # Categorization guide
+        - Groceries: Walmart (grocery), Target, Wegmans, Giant, H Mart, Kroger, Safeway, Trader Joe's,
+          Whole Foods, Aldi, Costco (grocery), Sprouts, Publix.
+        - Dining Out / Restaurants: any restaurant, cafe, fast food, coffee shop, DoorDash, Uber Eats,
+          Grubhub, Starbucks, Chipotle, McDonald's, Subway, Panda Express, etc.
+        - Transportation (includes gas/fuel): EV charging (Tesla Supercharger, EVgo, Electrify America),
+          Uber, Lyft, NTTA / tolls, parking, taxis, rental cars, gas / fuel stations (Exxon, Shell, Chevron,
+          BP, Sunoco, Circle K, Wawa, Fast Stop, 7-Eleven when fuel), public transit.
+        - Shopping / Retail: Amazon, eBay, Best Buy, Barnes & Noble, Office Depot, Staples, Home Depot,
+          Lowe's, Apple Store (hardware), department stores, clothing, electronics.
+        - Entertainment / Subscriptions: Spotify, Netflix, Hulu, Disney+, Apple.com/Bill, ChatGPT,
+          Tesla Subscription, Xbox, PlayStation, Audible, YouTube Premium, gaming.
+        - Utilities / Bills: AT&T, Verizon, T-Mobile, Comcast, Spectrum, electric/gas/water, USAA Insurance,
+          Progressive, Geico, State Farm.
+        - Healthcare / Medical: CVS, Walgreens, doctor offices, hospitals, labs, dental.
+        - Travel / Hotels: Airbnb, Booking.com, Expedia, Marriott, Hilton, airline tickets, Super.com *Hotels.
+        - Personal Care: salons, spas, barbershops, gyms, Planet Fitness.
+        - Education: tuition, courses, textbooks, Udemy, Coursera.
+        - Home / Maintenance: U-Haul, Goodyear, AutoZone, tire shops, hardware stores, cleaning services.
+        - Fees / Interest: late fees, overdraft fees, foreign transaction fees, DMV fees, USPS.
+        - Cash / ATM: ATM withdrawals, cash advances.
+        - Other: genuinely doesn't fit — use sparingly.
+
+        # Month detection
+        Return "YYYY-MM" based on the statement's CLOSING date (preferred) or most common transaction month.
+        - "Opening/Closing Date 12/08/25 - 01/07/26" → "2026-01"
+        - If the user provides a month hint, use it.
+        - If no dates exist and no hint is given, return "".
+
+        # Bank detection
+        Return the issuer name found in the statement header/letterhead in the `bank` field.
+        Use the canonical short name: "Chase", "American Express", "Bank of America", "Capital One",
+        "Discover", "Citi", "Wells Fargo", "USAA", "U.S. Bank", "Apple Card", "PayPal". If you cannot
+        identify it confidently, return "" (empty string).
+
+        # Absolute rules
+        - Extract EVERY transaction. Do not skip rows to save effort. Large statements may have 50-200 rows.
+        - Do NOT invent transactions; only use rows literally present in the input.
+        - Do NOT output the same row twice.
+        - Ignore legal boilerplate (APR disclosures, payment instructions, rewards summaries, terms).
+        - Do NOT compute totals; the backend does that.
+        """;
+
+    public SpendingAnalyzerService(HttpClient httpClient, IOptions<AzureAiOptions> options, ILogger<SpendingAnalyzerService> logger)
+    {
+        _httpClient = httpClient;
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    private string PrepareContent(string rawContent, string fileName)
+    {
+        const string prefix = "[PDF:base64]";
+        if (!rawContent.StartsWith(prefix))
+            return rawContent;
+
+        try
+        {
+            var base64 = rawContent.Substring(prefix.Length);
+            var bytes = Convert.FromBase64String(base64);
+            var sb = new StringBuilder();
+            using var stream = new MemoryStream(bytes);
+            using var pdf = PdfDocument.Open(stream);
+            foreach (var page in pdf.GetPages())
+            {
+                sb.AppendLine(page.Text);
+            }
+            var text = sb.ToString();
+            _logger.LogInformation("Extracted {Chars} chars from PDF {File}", text.Length, fileName);
+            return text;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to extract text from PDF {File}", fileName);
+            return $"[PDF extraction failed for {fileName}: {ex.Message}]";
+        }
+    }
+
+    // DTO the AI fills in. Flat list only — backend does all math.
+    private class AiFlatResponse
+    {
+        public string month { get; set; } = string.Empty;
+        public string bank { get; set; } = string.Empty;
+        public List<AiFlatTx> transactions { get; set; } = new();
+        public List<string> insights { get; set; } = new();
+        public List<string> suggestions { get; set; } = new();
+    }
+
+    private class AiFlatTx
+    {
+        public string date { get; set; } = string.Empty;
+        public string merchant { get; set; } = string.Empty;
+        public string description { get; set; } = string.Empty;
+        public decimal amount { get; set; }
+        public string category { get; set; } = string.Empty;
+    }
+
+    public async Task<Analysis> AnalyzeAsync(List<Statement> statements, string? month)
+    {
+        if (string.IsNullOrEmpty(_options.Endpoint) || string.IsNullOrEmpty(_options.ApiKey))
+            throw new InvalidOperationException("AI service not configured.");
+
+        // Process each statement INDEPENDENTLY so the model isn't asked to juggle
+        // multiple bank formats in one prompt (which can cause duplicates / inflated totals).
+        var allTx = new List<AiFlatTx>();
+        var allInsights = new List<string>();
+        var allSuggestions = new List<string>();
+        var detectedMonths = new List<string>();
+        var detectedBanks = new List<string>();
+        int rawCount = 0;
+
+        foreach (var statement in statements)
+        {
+            var perStatement = await ExtractFromOneAsync(statement, month);
+            rawCount += perStatement.transactions.Count;
+            allTx.AddRange(perStatement.transactions);
+            if (perStatement.insights != null) allInsights.AddRange(perStatement.insights);
+            if (perStatement.suggestions != null) allSuggestions.AddRange(perStatement.suggestions);
+            if (!string.IsNullOrWhiteSpace(perStatement.month))
+                detectedMonths.Add(perStatement.month);
+            if (!string.IsNullOrWhiteSpace(perStatement.bank))
+                detectedBanks.Add(perStatement.bank);
+        }
+
+        // Deduplicate across all statements: same (normalized description + signed amount) is a dup.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var unique = new List<AiFlatTx>(allTx.Count);
+        int duplicatesRemoved = 0;
+        foreach (var t in allTx)
+        {
+            var normDesc = System.Text.RegularExpressions.Regex.Replace(
+                (t.description ?? string.Empty).Trim(), @"\s+", " ");
+            var amt = Math.Round(t.amount, 2);
+            var key = $"{normDesc}|{(amt >= 0 ? "+" : "-")}{Math.Abs(amt)}|{t.date}";
+            if (seen.Add(key))
+                unique.Add(t);
+            else
+                duplicatesRemoved++;
+        }
+
+        // Group by category, sum deterministically. No trust in AI arithmetic.
+        var grouped = unique
+            .GroupBy(t => string.IsNullOrWhiteSpace(t.category) ? "Other" : t.category)
+            .Select(g => new SpendingCategory
+            {
+                Name = g.Key,
+                Total = g.Sum(t => t.amount),
+                Transactions = g.Select(t => new Transaction
+                {
+                    Date = t.date,
+                    Merchant = t.merchant,
+                    Description = t.description,
+                    Amount = t.amount
+                }).ToList()
+            })
+            .Where(c => c.Total > 0)
+            .ToList();
+
+        var totalSpent = grouped.Sum(c => c.Total);
+        foreach (var c in grouped)
+        {
+            c.Percentage = totalSpent > 0 ? Math.Round(c.Total / totalSpent * 100m, 1) : 0;
+        }
+        grouped = grouped.OrderByDescending(c => c.Total).ToList();
+
+        // Pick the month: user-provided > most common detected
+        var finalMonth = !string.IsNullOrWhiteSpace(month)
+            ? month!
+            : detectedMonths
+                .GroupBy(m => m)
+                .OrderByDescending(g => g.Count())
+                .ThenByDescending(g => g.Key)
+                .Select(g => g.Key)
+                .FirstOrDefault() ?? string.Empty;
+
+        // Pick bank: most common detected, joined with " + " if multiple unique
+        var finalBank = string.Empty;
+        if (detectedBanks.Count > 0)
+        {
+            var uniqueBanks = detectedBanks
+                .GroupBy(b => b, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(g => g.Count())
+                .Select(g => g.Key)
+                .ToList();
+            finalBank = uniqueBanks.Count == 1 ? uniqueBanks[0] : string.Join(" + ", uniqueBanks);
+        }
+
+        _logger.LogInformation(
+            "AI extraction: statements={N}, month={Month}, bank={Bank}, rawTx={Raw}, duplicatesRemoved={Dupes}, keptTx={Kept}, categories={Cats}, totalSpent={Total}",
+            statements.Count, finalMonth, finalBank, rawCount, duplicatesRemoved, unique.Count, grouped.Count, totalSpent);
+
+        if (string.IsNullOrWhiteSpace(finalMonth))
+            throw new MonthNotDeterminedException();
+
+        var funStats = BuildFunStats(unique, grouped, totalSpent);
+
+        return new Analysis
+        {
+            Month = finalMonth,
+            Bank = finalBank,
+            TotalSpent = totalSpent,
+            Categories = grouped,
+            Insights = allInsights.Distinct().Take(8).ToList(),
+            Suggestions = allSuggestions.Distinct().Take(8).ToList(),
+            FunStats = funStats
+        };
+    }
+
+    private async Task<AiFlatResponse> ExtractFromOneAsync(Statement statement, string? month)
+    {
+        var url = $"{_options.Endpoint}/openai/v1/chat/completions";
+        var stmtText = PrepareContent(statement.RawContent, statement.FileName);
+
+        var userMessage = !string.IsNullOrEmpty(month)
+            ? $"Extract transactions from the following bank/credit-card statement for the month of {month}. Only include transactions from that month.\n\n--- {statement.FileName} ---\n{stmtText}"
+            : $"Extract transactions from the following bank/credit-card statement. Determine the month from the statement's closing/transaction dates.\n\n--- {statement.FileName} ---\n{stmtText}";
+
+        var requestBody = new
+        {
+            model = _options.DeploymentName,
+            messages = new object[]
+            {
+                new { role = "system", content = SystemPrompt },
+                new { role = "user", content = userMessage }
+            },
+            temperature = 0.1,
+            max_completion_tokens = 16000,
+            response_format = new
+            {
+                type = "json_schema",
+                json_schema = new
+                {
+                    name = "transaction_extraction",
+                    strict = true,
+                    schema = new
+                    {
+                        type = "object",
+                        properties = new Dictionary<string, object>
+                        {
+                            ["month"] = new { type = "string" },
+                            ["bank"] = new { type = "string", description = "Issuer name detected from the statement (e.g., Chase, American Express, Bank of America, Capital One, Discover, Citi, Wells Fargo, USAA). Empty string if unknown." },
+                            ["transactions"] = new
+                            {
+                                type = "array",
+                                items = new
+                                {
+                                    type = "object",
+                                    properties = new Dictionary<string, object>
+                                    {
+                                        ["date"] = new { type = "string" },
+                                        ["merchant"] = new { type = "string" },
+                                        ["description"] = new { type = "string" },
+                                        ["amount"] = new { type = "number" },
+                                        ["category"] = new { type = "string", @enum = SpendingCategories }
+                                    },
+                                    required = new[] { "date", "merchant", "description", "amount", "category" },
+                                    additionalProperties = false
+                                }
+                            },
+                            ["insights"] = new { type = "array", items = new { type = "string" } },
+                            ["suggestions"] = new { type = "array", items = new { type = "string" } }
+                        },
+                        required = new[] { "month", "bank", "transactions", "insights", "suggestions" },
+                        additionalProperties = false
+                    }
+                }
+            }
+        };
+
+        var json = JsonSerializer.Serialize(requestBody);
+        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+        request.Headers.Add("api-key", _options.ApiKey);
+
+        var response = await _httpClient.SendAsync(request);
+        var responseBody = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new Exception($"AI request failed for {statement.FileName} ({response.StatusCode}): {responseBody}");
+
+        using var doc = JsonDocument.Parse(responseBody);
+        var content = doc.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString();
+
+        var parsed = JsonSerializer.Deserialize<AiFlatResponse>(content!,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            ?? throw new Exception($"Failed to parse AI response for {statement.FileName}.");
+
+        _logger.LogInformation(
+            "Per-statement extraction: file={File}, tx={Tx}, month={Month}",
+            statement.FileName, parsed.transactions.Count, parsed.month);
+
+        return parsed;
+    }
+
+    private static List<FunStat> BuildFunStats(List<AiFlatTx> txs, List<SpendingCategory> categories, decimal totalSpent)
+    {
+        var stats = new List<FunStat>();
+        var purchases = txs.Where(t => t.amount > 0).ToList();
+        if (purchases.Count == 0) return stats;
+
+        // 1) Biggest single purchase
+        var biggest = purchases.OrderByDescending(t => t.amount).First();
+        stats.Add(new FunStat
+        {
+            Emoji = "💸",
+            Label = "Biggest single purchase",
+            Value = $"${biggest.amount:F2} at {CleanMerchant(biggest)}"
+        });
+
+        // 2) Most-visited merchant (by count, tiebreak by spend)
+        var merchantGroups = purchases
+            .GroupBy(t => CleanMerchant(t), StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .Select(g => new { Name = g.Key, Count = g.Count(), Spend = g.Sum(x => x.amount) })
+            .ToList();
+        if (merchantGroups.Count > 0)
+        {
+            var top = merchantGroups
+                .OrderByDescending(m => m.Count)
+                .ThenByDescending(m => m.Spend)
+                .First();
+            if (top.Count >= 2)
+            {
+                stats.Add(new FunStat
+                {
+                    Emoji = "🏆",
+                    Label = "Most-visited merchant",
+                    Value = $"{top.Name} — {top.Count} times, ${top.Spend:F2}"
+                });
+            }
+        }
+
+        // 3) Biggest spending day
+        var dayGroups = purchases
+            .Where(t => !string.IsNullOrWhiteSpace(t.date))
+            .GroupBy(t => t.date.Trim())
+            .Select(g => new { Date = g.Key, Spend = g.Sum(x => x.amount), Count = g.Count() })
+            .OrderByDescending(d => d.Spend)
+            .ToList();
+        if (dayGroups.Count > 0)
+        {
+            var hot = dayGroups.First();
+            stats.Add(new FunStat
+            {
+                Emoji = "🔥",
+                Label = "Hottest spending day",
+                Value = $"{hot.Date} — ${hot.Spend:F2} across {hot.Count} {(hot.Count == 1 ? "purchase" : "purchases")}"
+            });
+        }
+
+        // 4) Top category share
+        if (categories.Count > 0)
+        {
+            var topCat = categories[0]; // already sorted desc
+            stats.Add(new FunStat
+            {
+                Emoji = "🥇",
+                Label = "Top category",
+                Value = $"{topCat.Name} — {topCat.Percentage}% of spend"
+            });
+        }
+
+        // 5) Small transactions count (under $10)
+        var smallCount = purchases.Count(t => t.amount < 10m);
+        if (smallCount >= 3)
+        {
+            var smallSum = purchases.Where(t => t.amount < 10m).Sum(t => t.amount);
+            stats.Add(new FunStat
+            {
+                Emoji = "🪙",
+                Label = "Small purchases (< $10)",
+                Value = $"{smallCount} transactions totaling ${smallSum:F2}"
+            });
+        }
+
+        // 6) Unique merchants
+        var uniqueMerchants = purchases
+            .Select(t => CleanMerchant(t))
+            .Where(m => !string.IsNullOrWhiteSpace(m))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        stats.Add(new FunStat
+        {
+            Emoji = "🛒",
+            Label = "Unique merchants",
+            Value = $"{uniqueMerchants} different places"
+        });
+
+        return stats;
+    }
+
+    private static string CleanMerchant(AiFlatTx t) =>
+        !string.IsNullOrWhiteSpace(t.merchant) ? t.merchant.Trim() : (t.description ?? string.Empty).Trim();
+}

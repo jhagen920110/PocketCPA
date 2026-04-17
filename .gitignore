@@ -1,8 +1,30 @@
+# Secrets / local config
 **/local.settings.json
+**/appsettings.Development.json
+**/.env
+**/.env.*
+
+# Build output
 node_modules/
 dist/
 build/
 bin/
 obj/
+.svelte-kit/
+
+# IDE
 .vs/
 .vscode/
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Local data — sample bank statements should never be committed
+*.pdf
+*.csv
+test-statement.*
+
+# Throwaway scratch project (contains hard-coded keys)
+pdftest/
