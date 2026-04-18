@@ -91,7 +91,7 @@
 		// Avg per transaction
 		out.push({
 			emoji: '📊',
-			label: 'Avg per txn',
+			label: 'Avg per transaction',
 			value: `$${fmt0(analysis.totalSpent / txs.length)}`
 		});
 

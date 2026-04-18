@@ -3,13 +3,14 @@
 	import { fade, scale, fly } from 'svelte/transition';
 	import { page } from '$app/state';
 	import { beforeNavigate, goto } from '$app/navigation';
-	import { initAuth, userEmail } from '$lib/auth';
+	import { initAuth, userEmail, displayName, setDisplayName, getDefaultName } from '$lib/auth';
 	import { isAnalyzing, analysesStore, loadAnalyses, ledgerStore, loadLedger } from '$lib/appState';
 
 	let { children } = $props();
 
 	let showSplash = $state(true);
 	let accountOpen = $state(false);
+	let nameDraft = $state('');
 
 	const SPLASH_MESSAGES = [
 		'🪙 Checking under the couch cushions…',
@@ -37,6 +38,12 @@
 	$effect(() => {
 		if (minSplashDone && (dataReady || !$userEmail)) {
 			showSplash = false;
+		}
+	});
+
+	$effect(() => {
+		if (accountOpen) {
+			nameDraft = $displayName === 'there' ? '' : $displayName;
 		}
 	});
 
@@ -162,9 +169,32 @@
 				</svg>
 			</button>
 			{#if accountOpen}
-				<div class="account-pop" in:fade={{ duration: 120 }}>
+				<div class="account-pop" in:fade={{ duration: 120 }} onclick={(e) => e.stopPropagation()} role="presentation">
 					<div class="account-label">Signed in as</div>
 					<div class="account-email">{$userEmail}</div>
+
+					<div class="account-label" style="margin-top: 12px;">Name</div>
+					<div class="name-row">
+						<input
+							class="name-input"
+							type="text"
+							bind:value={nameDraft}
+							placeholder={getDefaultName()}
+							maxlength="40"
+							onkeydown={(e) => {
+								if (e.key === 'Enter') {
+									setDisplayName(nameDraft);
+									accountOpen = false;
+								}
+							}}
+						/>
+						<button
+							type="button"
+							class="name-save"
+							onclick={() => { setDisplayName(nameDraft); accountOpen = false; }}
+						>Save</button>
+					</div>
+					<div class="name-hint">We'll use this anywhere we greet you.</div>
 				</div>
 			{/if}
 		</div>
@@ -366,12 +396,6 @@
 		margin-bottom: 8px;
 		color: #fff;
 	}
-	.splash-tag {
-		font-size: 0.95rem;
-		font-weight: 500;
-		color: rgba(255, 255, 255, 0.85);
-		margin-bottom: 28px;
-	}
 	.splash-msg-wrap {
 		position: relative;
 		height: 28px;
@@ -511,6 +535,44 @@
 		font-size: 0.9rem;
 		font-weight: 600;
 		word-break: break-all;
+	}
+	.name-row {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+	}
+	.name-input {
+		flex: 1;
+		min-width: 0;
+		padding: 8px 10px;
+		font-size: 0.9rem;
+		border: 1px solid #cbd5e1;
+		border-radius: 8px;
+		outline: none;
+		background: #fff;
+		color: #1f2937;
+	}
+	.name-input:focus {
+		border-color: #34d399;
+		box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.18);
+	}
+	.name-save {
+		padding: 8px 12px;
+		font-size: 0.85rem;
+		font-weight: 600;
+		border: none;
+		border-radius: 8px;
+		background: #34d399;
+		color: #065f46;
+		cursor: pointer;
+	}
+	.name-save:hover {
+		background: #6ee7b7;
+	}
+	.name-hint {
+		margin-top: 6px;
+		font-size: 0.72rem;
+		color: #94a3b8;
 	}
 
 	.page-body {

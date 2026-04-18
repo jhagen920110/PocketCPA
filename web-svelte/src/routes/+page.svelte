@@ -5,7 +5,7 @@
 	import type { AnalysisSummary, Analysis } from '$lib/api';
 	import CategoryBubbles from '$lib/components/CategoryBubbles.svelte';
 	import { categoryColor, shortCategory } from '$lib/colors';
-	import { userEmail } from '$lib/auth';
+	import { userEmail, displayName } from '$lib/auth';
 	import { analysesStore, loadAnalyses } from '$lib/appState';
 
 	let summaries = $state<AnalysisSummary[]>([]);
@@ -389,7 +389,7 @@
 			out.push({
 				emoji: '📅',
 				label: 'Busiest day',
-				value: `${dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} — $${fmt0(busiest.amount)} (${busiest.count} ${busiest.count === 1 ? 'txn' : 'txns'})`
+				value: `${dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} — $${fmt0(busiest.amount)} (${busiest.count} ${busiest.count === 1 ? 'transaction' : 'transactions'})`
 			});
 		}
 
@@ -488,14 +488,7 @@
 	// ---------- Conversational AI section. Builds a few short "messages"
 	// that feel like a friend reading your month over your shoulder, and
 	// includes any real AI insights/suggestions at the end. ----------
-	const firstName = $derived.by(() => {
-		const e = $userEmail ?? '';
-		if (!e) return 'there';
-		const local = e.split('@')[0] ?? '';
-		const bare = local.split(/[._-]/)[0] ?? '';
-		if (!bare) return 'there';
-		return bare.charAt(0).toUpperCase() + bare.slice(1).toLowerCase();
-	});
+	const firstName = $derived($displayName);
 
 	function catTotal(agg: Agg, name: string): number {
 		for (const c of agg.categories) if (c.name === name) return c.total;
