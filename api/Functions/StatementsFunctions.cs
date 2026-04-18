@@ -47,10 +47,10 @@ public class StatementsFunctions
         var response = req.CreateResponse(HttpStatusCode.Created);
         await response.WriteAsJsonAsync(new
         {
-            statement.Id,
-            statement.FileName,
-            statement.Month,
-            statement.UploadedAt
+            id = statement.Id,
+            fileName = statement.FileName,
+            month = statement.Month,
+            uploadedAt = statement.UploadedAt
         });
         return response;
     }

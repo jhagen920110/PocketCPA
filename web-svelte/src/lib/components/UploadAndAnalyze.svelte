@@ -4,7 +4,10 @@
 	import type { Analysis } from '$lib/api';
 	import { isAnalyzing } from '$lib/appState';
 
-	let { onAnalyzed }: { onAnalyzed: (analysis: Analysis) => void } = $props();
+	let { onAnalyzed, onAllDone }: {
+		onAnalyzed: (analysis: Analysis) => void;
+		onAllDone?: () => void;
+	} = $props();
 
 	type FileStatus = 'queued' | 'reading' | 'uploading' | 'analyzing' | 'done' | 'error';
 	interface Job {
@@ -77,6 +80,12 @@
 		} finally {
 			working = false;
 			isAnalyzing.set(false);
+			// Notify parent if every job ended (success or error) so it can close the modal
+			const allFinished = jobs.every((j) => j.status === 'done' || j.status === 'error');
+			const anySuccess = jobs.some((j) => j.status === 'done');
+			if (allFinished && anySuccess) {
+				onAllDone?.();
+			}
 		}
 	}
 

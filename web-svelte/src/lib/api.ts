@@ -2,11 +2,17 @@ import { get } from 'svelte/store';
 import { userEmail } from './auth';
 import { API_BASE } from './config';
 
+const isDev = typeof window !== 'undefined' &&
+	(window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
 export async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
-	const email = get(userEmail);
 	const headers = new Headers(options.headers);
-	if (email) {
-		headers.set('X-User-Email', email);
+	// In production, SWA injects a signed x-ms-client-principal header — the
+	// backend trusts that and ignores X-User-Email. Locally we have no SWA in
+	// front of Functions, so we still pass the dev email.
+	if (isDev) {
+		const email = get(userEmail);
+		if (email) headers.set('X-User-Email', email);
 	}
 	return fetch(`${API_BASE}${path}`, { ...options, headers });
 }

@@ -165,8 +165,8 @@
 		align-items: center;
 		gap: 3px;
 		padding: 2px 8px;
-		background: #eef2ff;
-		color: #4338ca;
+		background: #d1fae5;
+		color: #065f46;
 		border-radius: 999px;
 		font-size: 0.72rem;
 		font-weight: 600;
@@ -186,12 +186,12 @@
 	}
 
 	.btn-view {
-		background: #4f46e5;
+		background: #059669;
 		color: #fff;
 	}
 
 	.btn-view:hover {
-		background: #4338ca;
+		background: #047857;
 	}
 
 	.btn-delete {

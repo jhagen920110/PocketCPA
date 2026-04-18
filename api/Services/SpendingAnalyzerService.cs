@@ -21,10 +21,10 @@ public class SpendingAnalyzerService
 
     private static readonly string[] SpendingCategories =
     [
-        "Groceries", "Dining Out / Restaurants", "Transportation",
-        "Shopping / Retail", "Entertainment / Subscriptions", "Utilities / Bills",
-        "Healthcare / Medical", "Travel / Hotels", "Personal Care",
-        "Education", "Home / Maintenance", "Fees / Interest", "Cash / ATM", "Other"
+        "Groceries", "Eat Out", "Transport",
+        "Shopping", "Entertainment", "Subscription", "Utilities",
+        "Health", "Travel", "Personal",
+        "Education", "Maintenance", "Cash", "Other"
     ];
 
     private static readonly string SystemPrompt = $$"""
@@ -82,25 +82,27 @@ public class SpendingAnalyzerService
         # Categorization guide
         - Groceries: Walmart (grocery), Target, Wegmans, Giant, H Mart, Kroger, Safeway, Trader Joe's,
           Whole Foods, Aldi, Costco (grocery), Sprouts, Publix.
-        - Dining Out / Restaurants: any restaurant, cafe, fast food, coffee shop, DoorDash, Uber Eats,
+        - Eat Out: any restaurant, cafe, fast food, coffee shop, DoorDash, Uber Eats,
           Grubhub, Starbucks, Chipotle, McDonald's, Subway, Panda Express, etc.
-        - Transportation (includes gas/fuel): EV charging (Tesla Supercharger, EVgo, Electrify America),
+        - Transport (includes gas/fuel): EV charging (Tesla Supercharger, EVgo, Electrify America),
           Uber, Lyft, NTTA / tolls, parking, taxis, rental cars, gas / fuel stations (Exxon, Shell, Chevron,
           BP, Sunoco, Circle K, Wawa, Fast Stop, 7-Eleven when fuel), public transit.
-        - Shopping / Retail: Amazon, eBay, Best Buy, Barnes & Noble, Office Depot, Staples, Home Depot,
+        - Shopping: Amazon, eBay, Best Buy, Barnes & Noble, Office Depot, Staples, Home Depot,
           Lowe's, Apple Store (hardware), department stores, clothing, electronics.
-        - Entertainment / Subscriptions: Spotify, Netflix, Hulu, Disney+, Apple.com/Bill, ChatGPT,
-          Tesla Subscription, Xbox, PlayStation, Audible, YouTube Premium, gaming.
-        - Utilities / Bills: AT&T, Verizon, T-Mobile, Comcast, Spectrum, electric/gas/water, USAA Insurance,
+        - Entertainment: movies, concerts, events, games, streaming rentals, Xbox/PlayStation purchases,
+          gaming, ticket purchases.
+        - Subscription: recurring monthly/yearly subscriptions like Spotify, Netflix, Hulu, Disney+,
+          Apple.com/Bill, ChatGPT, Tesla Subscription, Audible, YouTube Premium, iCloud.
+        - Utilities: AT&T, Verizon, T-Mobile, Comcast, Spectrum, electric/gas/water, USAA Insurance,
           Progressive, Geico, State Farm.
-        - Healthcare / Medical: CVS, Walgreens, doctor offices, hospitals, labs, dental.
-        - Travel / Hotels: Airbnb, Booking.com, Expedia, Marriott, Hilton, airline tickets, Super.com *Hotels.
-        - Personal Care: salons, spas, barbershops, gyms, Planet Fitness.
+        - Health: CVS, Walgreens, doctor offices, hospitals, labs, dental.
+        - Travel: Airbnb, Booking.com, Expedia, Marriott, Hilton, airline tickets, Super.com *Hotels.
+        - Personal: salons, spas, barbershops, gyms, Planet Fitness.
         - Education: tuition, courses, textbooks, Udemy, Coursera.
-        - Home / Maintenance: U-Haul, Goodyear, AutoZone, tire shops, hardware stores, cleaning services.
-        - Fees / Interest: late fees, overdraft fees, foreign transaction fees, DMV fees, USPS.
-        - Cash / ATM: ATM withdrawals, cash advances.
-        - Other: genuinely doesn't fit — use sparingly.
+        - Maintenance: U-Haul, Goodyear, AutoZone, tire shops, hardware stores, cleaning services,
+          plumber, electrician, landscaping.
+        - Cash: ATM withdrawals, cash advances.
+        - Other: genuinely doesn't fit, or fees/interest/DMV/USPS — use sparingly.
 
         # Month detection
         Return "YYYY-MM" based on the statement's CLOSING date (preferred) or most common transaction month.
@@ -118,6 +120,12 @@ public class SpendingAnalyzerService
         - Extract EVERY transaction. Do not skip rows to save effort. Large statements may have 50-200 rows.
         - Do NOT invent transactions; only use rows literally present in the input.
         - Do NOT output the same row twice.
+        - Sign discipline: if the original row shows a leading "-" or the issuer marks it as a credit/return,
+          you MUST output a NEGATIVE amount. Sign-flipping a single refund can shift the user's total by
+          hundreds of dollars and is the #1 source of incorrect totals.
+        - When in doubt about a payment/credit row (e.g., "AUTOPAY", "PAYMENT - THANK YOU", "BALANCE
+          TRANSFER", "CASHBACK REDEMPTION", "STATEMENT CREDIT", "REWARDS REDEMPTION"), SKIP it. Better
+          to miss one payment than to count it as spending.
         - Ignore legal boilerplate (APR disclosures, payment instructions, rewards summaries, terms).
         - Do NOT compute totals; the backend does that.
         """;
@@ -304,7 +312,11 @@ public class SpendingAnalyzerService
                 new { role = "system", content = SystemPrompt },
                 new { role = "user", content = userMessage }
             },
-            temperature = 0.1,
+            // temperature 0 + fixed seed makes re-runs of the same statement
+            // produce the same transaction list (same total) instead of drifting
+            // by a few hundred dollars between runs.
+            temperature = 0,
+            seed = 42,
             max_completion_tokens = 16000,
             response_format = new
             {
@@ -473,7 +485,218 @@ public class SpendingAnalyzerService
             Value = $"{uniqueMerchants} different places"
         });
 
+        // 7) Average transaction
+        var avgTx = purchases.Average(t => t.amount);
+        stats.Add(new FunStat
+        {
+            Emoji = "📏",
+            Label = "Average transaction",
+            Value = $"${avgTx:F2}"
+        });
+
+        // 8) Median transaction
+        var sorted = purchases.OrderBy(t => t.amount).ToList();
+        var med = sorted.Count % 2 == 1
+            ? sorted[sorted.Count / 2].amount
+            : (sorted[sorted.Count / 2 - 1].amount + sorted[sorted.Count / 2].amount) / 2m;
+        stats.Add(new FunStat
+        {
+            Emoji = "⚖️",
+            Label = "Median transaction",
+            Value = $"${med:F2}"
+        });
+
+        // 9) Number of spending days
+        var uniqueDays = dayGroups.Count;
+        stats.Add(new FunStat
+        {
+            Emoji = "📅",
+            Label = "Days with spending",
+            Value = $"{uniqueDays} {(uniqueDays == 1 ? "day" : "days")}"
+        });
+
+        // 10) Transactions per active day
+        if (uniqueDays > 0)
+        {
+            var txPerDay = (double)purchases.Count / uniqueDays;
+            stats.Add(new FunStat
+            {
+                Emoji = "🧾",
+                Label = "Transactions per active day",
+                Value = $"{txPerDay:F1}"
+            });
+        }
+
+        // 11) Weekend vs weekday split
+        var weekendSpend = 0m;
+        var weekdaySpend = 0m;
+        foreach (var t in purchases)
+        {
+            if (TryParseTxDate(t.date, out var dt))
+            {
+                if (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday)
+                    weekendSpend += t.amount;
+                else
+                    weekdaySpend += t.amount;
+            }
+        }
+        if (weekendSpend + weekdaySpend > 0)
+        {
+            var weekendPct = weekendSpend / (weekendSpend + weekdaySpend) * 100m;
+            stats.Add(new FunStat
+            {
+                Emoji = "🎉",
+                Label = "Weekend share",
+                Value = $"{weekendPct:F0}% spent on weekends (${weekendSpend:F2})"
+            });
+        }
+
+        // 12) Favorite weekday
+        var byWeekday = purchases
+            .Select(t => TryParseTxDate(t.date, out var dt) ? (DayOfWeek?)dt.DayOfWeek : null)
+            .Where(d => d.HasValue)
+            .GroupBy(d => d!.Value)
+            .Select(g => new { Day = g.Key, Count = g.Count() })
+            .OrderByDescending(x => x.Count)
+            .ToList();
+        if (byWeekday.Count > 0)
+        {
+            stats.Add(new FunStat
+            {
+                Emoji = "🗓️",
+                Label = "Most-active weekday",
+                Value = $"{byWeekday[0].Day}s — {byWeekday[0].Count} purchases"
+            });
+        }
+
+        // 13) Longest no-spend streak
+        var spendDates = purchases
+            .Select(t => TryParseTxDate(t.date, out var dt) ? (DateTime?)dt.Date : null)
+            .Where(d => d.HasValue)
+            .Select(d => d!.Value)
+            .OrderBy(d => d)
+            .ToList();
+        if (spendDates.Count >= 2)
+        {
+            var maxGap = 0;
+            for (int i = 1; i < spendDates.Count; i++)
+            {
+                var gap = (int)(spendDates[i] - spendDates[i - 1]).TotalDays;
+                if (gap > maxGap) maxGap = gap;
+            }
+            if (maxGap >= 2)
+            {
+                stats.Add(new FunStat
+                {
+                    Emoji = "🧘",
+                    Label = "Longest no-spend streak",
+                    Value = $"{maxGap} {(maxGap == 1 ? "day" : "days")} in a row"
+                });
+            }
+        }
+
+        // 14) Spending per day (calendar)
+        if (spendDates.Count >= 2)
+        {
+            var span = (spendDates.Last() - spendDates.First()).TotalDays + 1;
+            if (span > 0)
+            {
+                var perDay = totalSpent / (decimal)span;
+                stats.Add(new FunStat
+                {
+                    Emoji = "📈",
+                    Label = "Daily average (calendar)",
+                    Value = $"${perDay:F2}/day over {span:F0} days"
+                });
+            }
+        }
+
+        // 15) Top 3 categories share
+        if (categories.Count >= 3)
+        {
+            var top3Sum = categories.Take(3).Sum(c => c.Percentage);
+            stats.Add(new FunStat
+            {
+                Emoji = "🎯",
+                Label = "Top 3 categories",
+                Value = $"{top3Sum:F0}% of your spend"
+            });
+        }
+
+        // 16) Biggest non-groceries non-bills purchase (discretionary splurge)
+        var splurge = purchases
+            .Where(t =>
+            {
+                var c = (t.category ?? string.Empty).ToLowerInvariant();
+                return !c.Contains("grocer") && !c.Contains("utilit") && !c.Contains("bill") &&
+                       !c.Contains("health") && !c.Contains("educat") && !c.Contains("fee");
+            })
+            .OrderByDescending(t => t.amount)
+            .FirstOrDefault();
+        if (splurge != null)
+        {
+            stats.Add(new FunStat
+            {
+                Emoji = "✨",
+                Label = "Biggest splurge",
+                Value = $"${splurge.amount:F2} at {CleanMerchant(splurge)}"
+            });
+        }
+
+        // 17) 80/20 rule
+        if (purchases.Count >= 5)
+        {
+            var sortedDesc = purchases.OrderByDescending(t => t.amount).ToList();
+            var top20Count = Math.Max(1, (int)Math.Ceiling(sortedDesc.Count * 0.2));
+            var top20Sum = sortedDesc.Take(top20Count).Sum(t => t.amount);
+            var top20Pct = top20Sum / totalSpent * 100m;
+            stats.Add(new FunStat
+            {
+                Emoji = "📊",
+                Label = "80/20 rule",
+                Value = $"Top {top20Count} buys = {top20Pct:F0}% of spend"
+            });
+        }
+
+        // 18) Categories touched
+        stats.Add(new FunStat
+        {
+            Emoji = "🧭",
+            Label = "Categories touched",
+            Value = $"{categories.Count} of 14"
+        });
+
+        // 19) Refunds received
+        var refunds = txs.Where(t => t.amount < 0).ToList();
+        if (refunds.Count > 0)
+        {
+            var refundSum = refunds.Sum(t => -t.amount);
+            stats.Add(new FunStat
+            {
+                Emoji = "↩️",
+                Label = "Refunds / returns",
+                Value = $"{refunds.Count} totaling ${refundSum:F2}"
+            });
+        }
+
         return stats;
+    }
+
+    private static bool TryParseTxDate(string s, out DateTime dt)
+    {
+        dt = default;
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        var trimmed = s.Trim();
+        // Full ISO
+        if (DateTime.TryParseExact(trimmed, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out dt)) return true;
+        // US long
+        if (DateTime.TryParseExact(trimmed, new[] { "M/d/yyyy", "MM/dd/yyyy", "M/d/yy", "MM/dd/yy" },
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out dt)) return true;
+        // Fallback: best-effort
+        return DateTime.TryParse(trimmed, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out dt);
     }
 
     private static string CleanMerchant(AiFlatTx t) =>
