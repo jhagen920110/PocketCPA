@@ -26,6 +26,7 @@ string? bankFilter = null;
 string? monthFilter = null;
 bool dumpTx = false;
 bool apply = false;
+string? deleteAnalysisUser = null;
 for (int i = argList.Count - 1; i >= 0; i--)
 {
     if (argList[i] == "--runs" && i + 1 < argList.Count)
@@ -62,6 +63,11 @@ for (int i = argList.Count - 1; i >= 0; i--)
     {
         apply = true;
         argList.RemoveAt(i);
+    }
+    else if (argList[i] == "--delete-analysis" && i + 1 < argList.Count)
+    {
+        deleteAnalysisUser = argList[i + 1];
+        argList.RemoveRange(i, 2);
     }
 }
 
@@ -102,6 +108,35 @@ var service = new SpendingAnalyzerService(http, aiOpts, logger);
 if (cleanupUser != null)
 {
     await RunCleanupMode(cleanupUser, apply, monthFilter);
+    return;
+}
+
+if (deleteAnalysisUser != null)
+{
+    if (string.IsNullOrWhiteSpace(monthFilter))
+    {
+        Console.Error.WriteLine("--delete-analysis requires --month <YYYY-MM>");
+        return;
+    }
+    using var dc = new CosmosClient(Get("CosmosDb__Endpoint"), Get("CosmosDb__Key"));
+    var acont = dc.GetDatabase(Get("CosmosDb__DatabaseName")).GetContainer("analyses");
+    var dq = new QueryDefinition("SELECT c.id FROM c WHERE c.userId=@u AND c.month=@m")
+        .WithParameter("@u", deleteAnalysisUser).WithParameter("@m", monthFilter);
+    var dpk = new PartitionKey(deleteAnalysisUser);
+    var ids = new List<string>();
+    using (var dit = acont.GetItemQueryIterator<IdRow>(dq,
+        requestOptions: new QueryRequestOptions { PartitionKey = dpk }))
+    {
+        while (dit.HasMoreResults)
+            foreach (var r in await dit.ReadNextAsync()) ids.Add(r.id);
+    }
+    Console.WriteLine($"Found {ids.Count} analysis doc(s) for user={deleteAnalysisUser} month={monthFilter}");
+    if (!apply) { Console.WriteLine("DRY RUN — pass --apply to actually delete."); return; }
+    foreach (var id in ids)
+    {
+        try { await acont.DeleteItemAsync<object>(id, dpk); Console.WriteLine($"Deleted {id}"); }
+        catch (CosmosException ex) { Console.WriteLine($"FAIL {id}: {ex.StatusCode}"); }
+    }
     return;
 }
 
