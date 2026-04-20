@@ -262,7 +262,11 @@ public class SpendingAnalyzerService
 
         foreach (var statement in statements)
         {
-            var perStatement = await ExtractFromOneAsync(statement, month);
+            // Self-verification: extract each statement up to 3 times and take the
+            // consensus. This catches rare AI drift (e.g. one pass hallucinating a
+            // $10k/$100k row, or missing a whole page of transactions) without
+            // doubling cost for the common case where two runs already agree.
+            var perStatement = await ExtractFromOneVerifiedAsync(statement, month);
             rawCount += perStatement.transactions.Count;
             allTx.AddRange(perStatement.transactions);
             if (perStatement.insights != null) allInsights.AddRange(perStatement.insights);
@@ -440,6 +444,88 @@ public class SpendingAnalyzerService
             Suggestions = allSuggestions.Distinct().Take(8).ToList(),
             FunStats = funStats
         };
+    }
+
+    // Shape of one extraction pass used for agreement checks. Sum-of-abs amounts
+    // + tx count is a strong fingerprint: two runs that agree on both almost
+    // always have the same transactions, regardless of AI tie-breaking order.
+    private static (decimal SumAbs, int Count) Fingerprint(AiFlatResponse r)
+    {
+        decimal sum = 0m;
+        foreach (var t in r.transactions) sum += Math.Abs(t.amount);
+        return (Math.Round(sum, 2), r.transactions.Count);
+    }
+
+    private static bool Agree((decimal SumAbs, int Count) a, (decimal SumAbs, int Count) b)
+    {
+        if (Math.Abs(a.Count - b.Count) > 2) return false;
+        if (a.SumAbs == 0m && b.SumAbs == 0m) return true;
+        var scale = Math.Max(a.SumAbs, b.SumAbs);
+        if (scale == 0m) return true;
+        var diff = Math.Abs(a.SumAbs - b.SumAbs);
+        // within 1% of the larger total, OR within $2 absolute (whichever is larger).
+        return diff <= Math.Max(scale * 0.01m, 2m);
+    }
+
+    // Runs ExtractFromOneAsync twice; if the two runs agree (fingerprints match
+    // within tolerance) we trust the first. If they disagree we run a third
+    // tiebreaker pass and pick the pair that agree — returning whichever of
+    // that pair has the MORE transactions (rows are more likely to be missed
+    // than invented, and our oversized-row guard already drops hallucinated
+    // big-ticket rows downstream).
+    private async Task<AiFlatResponse> ExtractFromOneVerifiedAsync(Statement statement, string? month)
+    {
+        var run1 = await ExtractFromOneAsync(statement, month);
+        var fp1 = Fingerprint(run1);
+
+        var run2 = await ExtractFromOneAsync(statement, month);
+        var fp2 = Fingerprint(run2);
+
+        if (Agree(fp1, fp2))
+        {
+            _logger.LogInformation(
+                "Verification OK for {File}: run1={Sum1:C2}/{N1}tx ≈ run2={Sum2:C2}/{N2}tx",
+                statement.FileName, fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count);
+            // Prefer the run with more transactions (missed rows > invented rows in practice).
+            return run2.transactions.Count > run1.transactions.Count ? run2 : run1;
+        }
+
+        _logger.LogWarning(
+            "Verification MISMATCH for {File}: run1={Sum1:C2}/{N1}tx vs run2={Sum2:C2}/{N2}tx — running tiebreaker",
+            statement.FileName, fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count);
+
+        var run3 = await ExtractFromOneAsync(statement, month);
+        var fp3 = Fingerprint(run3);
+
+        // Pick the pair that agree; within that pair, prefer more transactions.
+        (AiFlatResponse Pick, AiFlatResponse Partner, string Which) picked;
+        if (Agree(fp1, fp3)) picked = (run1, run3, "runs 1+3");
+        else if (Agree(fp2, fp3)) picked = (run2, run3, "runs 2+3");
+        else if (Agree(fp1, fp2)) picked = (run1, run2, "runs 1+2");
+        else
+        {
+            // No pair agreed — all three drifted. Fall back to the median-sum run.
+            var sorted = new[] {
+                (Run: run1, Fp: fp1),
+                (Run: run2, Fp: fp2),
+                (Run: run3, Fp: fp3)
+            }.OrderBy(x => x.Fp.SumAbs).ToList();
+            var median = sorted[1];
+            _logger.LogError(
+                "Verification FAILED for {File}: all 3 runs disagree " +
+                "(run1={S1:C2}/{N1} run2={S2:C2}/{N2} run3={S3:C2}/{N3}) — using median-total run",
+                statement.FileName,
+                fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count, fp3.SumAbs, fp3.Count);
+            return median.Run;
+        }
+
+        _logger.LogInformation(
+            "Verification resolved for {File} via {Which}: picked {N}tx sumAbs={Sum:C2}",
+            statement.FileName, picked.Which,
+            Math.Max(picked.Pick.transactions.Count, picked.Partner.transactions.Count),
+            Fingerprint(picked.Pick).SumAbs);
+        return picked.Pick.transactions.Count >= picked.Partner.transactions.Count
+            ? picked.Pick : picked.Partner;
     }
 
     private async Task<AiFlatResponse> ExtractFromOneAsync(Statement statement, string? month)
