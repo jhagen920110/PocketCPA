@@ -24,9 +24,37 @@
 		'🍜 Ramen is a vibe, right?',
 		'🧠 Coaching your wallet…',
 		'✨ Sprinkling fairy dust…',
-		'🐿️ Stashing nuts for winter…'
+		'🐿️ Stashing nuts for winter…',
+		'🧮 Double-checking the math…',
+		'🥑 Subtracting the avocado toast…',
+		'📈 Plotting a smarter future…',
+		'🏦 Whispering to the bank…',
+		'🧺 Folding receipts into origami…',
+		'🎯 Locking onto your goals…',
+		'🧹 Sweeping up stray subscriptions…',
+		'🪄 Turning lattes into savings…',
+		'🧊 Chilling your impulse buys…',
+		'🚀 Launching your budget…',
+		'🍪 Bribing the spreadsheet with cookies…',
+		'🦊 Outfoxing those sneaky fees…',
+		'📬 Opening every statement, gently…',
+		'🛡️ Shielding your wallet from surprises…',
+		'🌱 Growing a tiny money tree…',
+		'🎲 Rolling the dice on dinner out…'
 	];
-	let splashIdx = $state(0);
+	// Session-scoped shown counts so repeats are deprioritized until the list recycles.
+	const shownCounts: number[] = SPLASH_MESSAGES.map(() => 0);
+	function pickNextSplashIdx(current: number): number {
+		const minSeen = Math.min(...shownCounts);
+		const pool: number[] = [];
+		for (let i = 0; i < SPLASH_MESSAGES.length; i++) {
+			if (shownCounts[i] === minSeen && i !== current) pool.push(i);
+		}
+		const candidates = pool.length > 0 ? pool : SPLASH_MESSAGES.map((_, i) => i).filter((i) => i !== current);
+		return candidates[Math.floor(Math.random() * candidates.length)] ?? current;
+	}
+	let splashIdx = $state(Math.floor(Math.random() * SPLASH_MESSAGES.length));
+	shownCounts[splashIdx] = 1;
 	let minSplashDone = $state(false);
 	let dataReady = $state(false);
 
@@ -52,9 +80,11 @@
 	onMount(() => {
 		initAuth();
 
-		// Cycle through cute messages.
+		// Cycle through cute messages — random, but deprioritize ones already shown this session.
 		const msgTimer = setInterval(() => {
-			splashIdx = (splashIdx + 1) % SPLASH_MESSAGES.length;
+			const next = pickNextSplashIdx(splashIdx);
+			splashIdx = next;
+			shownCounts[next] = (shownCounts[next] ?? 0) + 1;
 		}, 1800);
 
 		// Minimum splash time so it doesn't flicker away instantly.
@@ -94,6 +124,29 @@
 		};
 		document.addEventListener('touchmove', blockMultiTouch, { passive: false });
 
+		// Block iOS Safari / some Android browsers' edge-swipe back navigation
+		// by preventing touchmove that starts near the left or right screen edge.
+		const EDGE_PX = 24;
+		let edgeSwipe = false;
+		const onEdgeTouchStart = (e: TouchEvent) => {
+			if (e.touches.length !== 1) {
+				edgeSwipe = false;
+				return;
+			}
+			const x = e.touches[0].clientX;
+			edgeSwipe = x <= EDGE_PX || x >= window.innerWidth - EDGE_PX;
+		};
+		const onEdgeTouchMove = (e: TouchEvent) => {
+			if (edgeSwipe) e.preventDefault();
+		};
+		const onEdgeTouchEnd = () => {
+			edgeSwipe = false;
+		};
+		document.addEventListener('touchstart', onEdgeTouchStart, { passive: true });
+		document.addEventListener('touchmove', onEdgeTouchMove, { passive: false });
+		document.addEventListener('touchend', onEdgeTouchEnd, { passive: true });
+		document.addEventListener('touchcancel', onEdgeTouchEnd, { passive: true });
+
 		// Close account popover when clicking outside.
 		const onDocClick = (e: MouseEvent) => {
 			const target = e.target as HTMLElement | null;
@@ -111,6 +164,10 @@
 			document.removeEventListener('gestureend', blockGesture);
 			document.removeEventListener('touchend', blockDoubleTap);
 			document.removeEventListener('touchmove', blockMultiTouch);
+			document.removeEventListener('touchstart', onEdgeTouchStart);
+			document.removeEventListener('touchmove', onEdgeTouchMove);
+			document.removeEventListener('touchend', onEdgeTouchEnd);
+			document.removeEventListener('touchcancel', onEdgeTouchEnd);
 			document.removeEventListener('click', onDocClick);
 		};
 	});
@@ -282,6 +339,8 @@
 		touch-action: manipulation;
 		-ms-content-zooming: none;
 		background: #6ee7b7;
+		/* Disable browser swipe-back / swipe-forward navigation gestures. */
+		overscroll-behavior-x: none;
 	}
 
 	:global(body) {
@@ -294,6 +353,8 @@
 		color: #1f2937;
 		min-height: 100vh;
 		letter-spacing: -0.01em;
+		/* Belt-and-suspenders: also block horizontal overscroll on body. */
+		overscroll-behavior-x: none;
 	}
 
 	:global(h1),
@@ -402,8 +463,11 @@
 	.splash-msg-wrap {
 		position: relative;
 		height: 28px;
-		margin-top: 14px;
+		margin: 14px auto 0;
 		width: min(92vw, 420px);
+		max-width: 92vw;
+		left: 50%;
+		transform: translateX(-50%);
 		display: flex;
 		align-items: center;
 		justify-content: center;
