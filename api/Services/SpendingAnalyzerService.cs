@@ -458,13 +458,17 @@ public class SpendingAnalyzerService
 
     private static bool Agree((decimal SumAbs, int Count) a, (decimal SumAbs, int Count) b)
     {
-        if (Math.Abs(a.Count - b.Count) > 2) return false;
+        // Allow slightly more tx drift on large statements (big months naturally
+        // have more borderline rows the AI might include or drop).
+        var maxCount = Math.Max(a.Count, b.Count);
+        var countTolerance = maxCount >= 80 ? 5 : 3;
+        if (Math.Abs(a.Count - b.Count) > countTolerance) return false;
         if (a.SumAbs == 0m && b.SumAbs == 0m) return true;
         var scale = Math.Max(a.SumAbs, b.SumAbs);
         if (scale == 0m) return true;
         var diff = Math.Abs(a.SumAbs - b.SumAbs);
-        // within 1% of the larger total, OR within $2 absolute (whichever is larger).
-        return diff <= Math.Max(scale * 0.01m, 2m);
+        // within 2% of the larger total, OR within $5 absolute (whichever is larger).
+        return diff <= Math.Max(scale * 0.02m, 5m);
     }
 
     // Runs ExtractFromOneAsync twice; if the two runs agree (fingerprints match
@@ -494,13 +498,29 @@ public class SpendingAnalyzerService
             "Verification MISMATCH for {File}: run1={Sum1:C2}/{N1}tx vs run2={Sum2:C2}/{N2}tx — running tiebreaker",
             statement.FileName, fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count);
 
-        var run3 = await ExtractFromOneAsync(statement, month);
-        var fp3 = Fingerprint(run3);
+        AiFlatResponse? run3 = null;
+        (decimal SumAbs, int Count)? fp3 = null;
+        try
+        {
+            run3 = await ExtractFromOneAsync(statement, month);
+            fp3 = Fingerprint(run3);
+        }
+        catch (Exception ex)
+        {
+            // Tiebreaker crashed (commonly: model hit output-token cap on a very
+            // large month and returned truncated JSON). Don't fail the whole
+            // statement — fall back to whichever of runs 1/2 has more txs.
+            _logger.LogError(ex,
+                "Tiebreaker run crashed for {File}; falling back to the better of runs 1 and 2",
+                statement.FileName);
+            return run1.transactions.Count >= run2.transactions.Count ? run1 : run2;
+        }
 
+        var fp3Val = fp3!.Value;
         // Pick the pair that agree; within that pair, prefer more transactions.
         (AiFlatResponse Pick, AiFlatResponse Partner, string Which) picked;
-        if (Agree(fp1, fp3)) picked = (run1, run3, "runs 1+3");
-        else if (Agree(fp2, fp3)) picked = (run2, run3, "runs 2+3");
+        if (Agree(fp1, fp3Val)) picked = (run1, run3!, "runs 1+3");
+        else if (Agree(fp2, fp3Val)) picked = (run2, run3!, "runs 2+3");
         else if (Agree(fp1, fp2)) picked = (run1, run2, "runs 1+2");
         else
         {
@@ -508,14 +528,14 @@ public class SpendingAnalyzerService
             var sorted = new[] {
                 (Run: run1, Fp: fp1),
                 (Run: run2, Fp: fp2),
-                (Run: run3, Fp: fp3)
+                (Run: run3!, Fp: fp3Val)
             }.OrderBy(x => x.Fp.SumAbs).ToList();
             var median = sorted[1];
             _logger.LogError(
                 "Verification FAILED for {File}: all 3 runs disagree " +
                 "(run1={S1:C2}/{N1} run2={S2:C2}/{N2} run3={S3:C2}/{N3}) — using median-total run",
                 statement.FileName,
-                fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count, fp3.SumAbs, fp3.Count);
+                fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count, fp3Val.SumAbs, fp3Val.Count);
             return median.Run;
         }
 
@@ -550,7 +570,9 @@ public class SpendingAnalyzerService
             // by a few hundred dollars between runs.
             temperature = 0,
             seed = 42,
-            max_completion_tokens = 16000,
+            // 32k covers the largest real statements we've seen (~200 tx → ~22k chars of JSON).
+            // Previously 16k occasionally truncated mid-array on big months.
+            max_completion_tokens = 32000,
             response_format = new
             {
                 type = "json_schema",
@@ -607,15 +629,30 @@ public class SpendingAnalyzerService
             throw new Exception($"AI request failed for {statement.FileName} ({response.StatusCode}): {responseBody}");
 
         using var doc = JsonDocument.Parse(responseBody);
-        var content = doc.RootElement
-            .GetProperty("choices")[0]
-            .GetProperty("message")
-            .GetProperty("content")
-            .GetString();
+        var choice = doc.RootElement.GetProperty("choices")[0];
+        var content = choice.GetProperty("message").GetProperty("content").GetString();
+        var finishReason = choice.TryGetProperty("finish_reason", out var fr) ? fr.GetString() : null;
 
-        var parsed = JsonSerializer.Deserialize<AiFlatResponse>(content!,
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-            ?? throw new Exception($"Failed to parse AI response for {statement.FileName}.");
+        AiFlatResponse? parsed = null;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<AiFlatResponse>(content!,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch (JsonException jex)
+        {
+            // Response was truncated mid-array (usually finish_reason="length" on
+            // very large statements). Recover whatever transactions we got by
+            // closing the JSON at the last complete transaction, so we keep ~150
+            // good txs instead of losing the entire statement.
+            _logger.LogWarning(jex,
+                "Truncated AI JSON for {File} (finish_reason={FR}); attempting recovery",
+                statement.FileName, finishReason ?? "null");
+            parsed = TryRecoverTruncatedJson(content!, statement.FileName);
+        }
+
+        if (parsed == null)
+            throw new Exception($"Failed to parse AI response for {statement.FileName} (finish_reason={finishReason}).");
 
         _logger.LogInformation(
             "Per-statement extraction: file={File}, tx={Tx}, month={Month}",
@@ -631,6 +668,98 @@ public class SpendingAnalyzerService
     private static readonly System.Text.RegularExpressions.Regex OrderNumberRegex =
         new(@"\b(?:Order\s*Number[:\s]*)?(\d{3}-\d{7}-\d{7})\b",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    // Salvage as many transactions as possible from an AI response that was cut
+    // off mid-JSON (usually because max_completion_tokens was reached on a very
+    // large statement). Strategy: find the transactions array, walk the brace
+    // balance forward, and keep every COMPLETE {...} object inside it. Return
+    // an AiFlatResponse with those txs and empty insights/suggestions — we'd
+    // rather have 150 correct txs than zero.
+    private AiFlatResponse? TryRecoverTruncatedJson(string content, string fileName)
+    {
+        try
+        {
+            var arrStart = content.IndexOf("\"transactions\"", StringComparison.Ordinal);
+            if (arrStart < 0) return null;
+            arrStart = content.IndexOf('[', arrStart);
+            if (arrStart < 0) return null;
+
+            // Also try to pull month + bank out of the JSON head (they come before transactions).
+            string month = "";
+            string bank = "";
+            var mMatch = System.Text.RegularExpressions.Regex.Match(
+                content[..arrStart], "\"month\"\\s*:\\s*\"([^\"]*)\"");
+            if (mMatch.Success) month = mMatch.Groups[1].Value;
+            var bMatch = System.Text.RegularExpressions.Regex.Match(
+                content[..arrStart], "\"bank\"\\s*:\\s*\"([^\"]*)\"");
+            if (bMatch.Success) bank = bMatch.Groups[1].Value;
+
+            var txs = new List<AiFlatTx>();
+            int i = arrStart + 1;
+            int depth = 0;
+            int objStart = -1;
+            bool inStr = false;
+            bool esc = false;
+            while (i < content.Length)
+            {
+                char c = content[i];
+                if (inStr)
+                {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                }
+                else
+                {
+                    if (c == '"') inStr = true;
+                    else if (c == '{')
+                    {
+                        if (depth == 0) objStart = i;
+                        depth++;
+                    }
+                    else if (c == '}')
+                    {
+                        depth--;
+                        if (depth == 0 && objStart >= 0)
+                        {
+                            var objJson = content.Substring(objStart, i - objStart + 1);
+                            try
+                            {
+                                var tx = JsonSerializer.Deserialize<AiFlatTx>(objJson,
+                                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                                if (tx != null) txs.Add(tx);
+                            }
+                            catch { /* skip malformed tx */ }
+                            objStart = -1;
+                        }
+                    }
+                    else if (c == ']' && depth == 0)
+                    {
+                        break; // reached natural end of transactions array
+                    }
+                }
+                i++;
+            }
+
+            _logger.LogWarning(
+                "Recovered {N} transactions from truncated JSON for {File} (month={Month} bank={Bank})",
+                txs.Count, fileName, month, bank);
+
+            return new AiFlatResponse
+            {
+                month = month,
+                bank = bank,
+                transactions = txs,
+                insights = new List<string>(),
+                suggestions = new List<string>()
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Recovery of truncated JSON failed for {File}", fileName);
+            return null;
+        }
+    }
 
     private static (List<AiFlatTx> txs, int netted) NetAmazonRefunds(List<AiFlatTx> input)
     {
