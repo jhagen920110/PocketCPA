@@ -524,8 +524,35 @@ public class SpendingAnalyzerService
     // that pair has the MORE transactions (rows are more likely to be missed
     // than invented, and our oversized-row guard already drops hallucinated
     // big-ticket rows downstream).
+    //
+    // For LARGE statements we skip single-shot entirely and go straight to
+    // chunked-by-design extraction. Single-shot on big PDFs repeatedly hits
+    // Azure's content filter / token cap, producing unstable run-to-run
+    // totals. Chunked mode breaks the PDF into small page-group chunks that
+    // each fit comfortably inside the token budget, and every chunk is itself
+    // dual-run verified (see ExtractFromChunksAsync), so the whole statement
+    // is effectively multi-verified without the outer dual-run overhead.
     private async Task<AiFlatResponse> ExtractFromOneVerifiedAsync(Statement statement, string? month)
     {
+        // Chunked-by-design threshold. Tuned so statements that have ever
+        // truncated single-shot on real data (2025-09 was ~11k chars / 8 pages)
+        // take the chunked path from the start.
+        const int LargeCharThreshold = 8000;
+        const int LargePageThreshold = 4;
+
+        var pages = ExtractPages(statement.RawContent, statement.FileName);
+        var stmtText = PrepareContent(statement.RawContent, statement.FileName);
+        bool isLarge = pages != null &&
+            (stmtText.Length >= LargeCharThreshold || pages.Count >= LargePageThreshold);
+
+        if (isLarge && pages != null)
+        {
+            _logger.LogInformation(
+                "Large statement {File} ({Chars} chars, {Pages} pages) — chunked-by-design with per-chunk dual-run",
+                statement.FileName, stmtText.Length, pages.Count);
+            return await ExtractFromChunksAsync(statement, pages, month);
+        }
+
         var run1 = await ExtractFromOneAsync(statement, month);
         var fp1 = Fingerprint(run1);
 
@@ -548,7 +575,6 @@ public class SpendingAnalyzerService
         // Before burning another single-shot call, try chunked mode — it's
         // usually the real fix when runs disagree on a big statement (the
         // single-shot call is truncating or content-filtering intermittently).
-        var pages = ExtractPages(statement.RawContent, statement.FileName);
         if (pages != null && pages.Count >= 2)
         {
             try
@@ -698,15 +724,18 @@ public class SpendingAnalyzerService
 
     // Split the statement into page-range chunks (each chunk ~6k chars of PDF
     // text, roughly 30-60 transactions) and analyze each chunk independently.
-    // The chunks are then merged: union all transactions, vote on month/bank.
-    // Each chunk uses the same strict system prompt; the user message tells
-    // the model it's analyzing only part of the statement.
+    // Every chunk is dual-run verified — since chunks are small enough to
+    // never hit the content filter or token cap, two runs of the same chunk
+    // should agree; if they don't, we pick the one with more transactions
+    // (missed rows > invented rows; the downstream oversized-row guard drops
+    // hallucinations). The chunks are then merged: union all transactions,
+    // vote on month/bank.
     private async Task<AiFlatResponse> ExtractFromChunksAsync(Statement statement, List<string> pages, string? month)
     {
         const int MaxCharsPerChunk = 6000;
         var chunks = PackPagesIntoChunks(pages, MaxCharsPerChunk);
         _logger.LogInformation(
-            "Chunked extraction for {File}: {Pages} pages → {Chunks} chunks",
+            "Chunked extraction for {File}: {Pages} pages → {Chunks} chunks (per-chunk dual-run)",
             statement.FileName, pages.Count, chunks.Count);
 
         var merged = new AiFlatResponse();
@@ -719,18 +748,43 @@ public class SpendingAnalyzerService
                 ? $"This is PART {c + 1} of {chunks.Count} of the statement '{statement.FileName}' for the month of {month}. Extract ONLY the transactions visible in this part; other parts of the statement will be processed separately. Do not skip transactions to avoid double-counting — the backend handles deduplication.\n\n{chunks[c]}"
                 : $"This is PART {c + 1} of {chunks.Count} of the statement '{statement.FileName}'. Extract ONLY the transactions visible in this part; other parts of the statement will be processed separately. Do not skip transactions to avoid double-counting — the backend handles deduplication. Still return the statement's month/bank from any header info in this part (empty string if not visible here).\n\n{chunks[c]}";
 
+            AiFlatResponse? picked = null;
             try
             {
-                var (chunkParsed, chunkFinish, chunkRecovered) = await CallAiAsync(chunkMsg, $"{statement.FileName}[part{c + 1}/{chunks.Count}]");
-                merged.transactions.AddRange(chunkParsed.transactions);
-                if (chunkParsed.insights != null) merged.insights.AddRange(chunkParsed.insights);
-                if (chunkParsed.suggestions != null) merged.suggestions.AddRange(chunkParsed.suggestions);
-                if (!string.IsNullOrWhiteSpace(chunkParsed.month)) months.Add(chunkParsed.month);
-                if (!string.IsNullOrWhiteSpace(chunkParsed.bank)) banks.Add(chunkParsed.bank);
-                _logger.LogInformation(
-                    "Chunk {N}/{Total} of {File}: tx={Tx} finish={FR} recovered={Rec}",
-                    c + 1, chunks.Count, statement.FileName, chunkParsed.transactions.Count,
-                    chunkFinish ?? "null", chunkRecovered);
+                var tag = $"{statement.FileName}[part{c + 1}/{chunks.Count}]";
+                var (r1, f1, rec1) = await CallAiAsync(chunkMsg, tag + ":run1");
+                var (r2, f2, rec2) = await CallAiAsync(chunkMsg, tag + ":run2");
+
+                var fp1 = Fingerprint(r1);
+                var fp2 = Fingerprint(r2);
+
+                if (Agree(fp1, fp2))
+                {
+                    picked = r2.transactions.Count > r1.transactions.Count ? r2 : r1;
+                    _logger.LogInformation(
+                        "Chunk {N}/{Total} of {File} verified: r1={S1:C2}/{N1}tx ≈ r2={S2:C2}/{N2}tx (finish=r1:{F1}/r2:{F2})",
+                        c + 1, chunks.Count, statement.FileName,
+                        fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count,
+                        f1 ?? "null", f2 ?? "null");
+                }
+                else
+                {
+                    // Chunks are small, so disagreement is rare. Pick the run
+                    // with more transactions — same policy as the statement-level
+                    // verifier. (No 3rd-run tiebreaker here to keep per-chunk
+                    // cost bounded; chunked mode already calls 2× per chunk.)
+                    picked = r1.transactions.Count >= r2.transactions.Count ? r1 : r2;
+                    _logger.LogWarning(
+                        "Chunk {N}/{Total} of {File} MISMATCH: r1={S1:C2}/{N1}tx vs r2={S2:C2}/{N2}tx — taking larger tx count ({Picked}tx)",
+                        c + 1, chunks.Count, statement.FileName,
+                        fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count, picked.transactions.Count);
+                }
+
+                merged.transactions.AddRange(picked.transactions);
+                if (picked.insights != null) merged.insights.AddRange(picked.insights);
+                if (picked.suggestions != null) merged.suggestions.AddRange(picked.suggestions);
+                if (!string.IsNullOrWhiteSpace(picked.month)) months.Add(picked.month);
+                if (!string.IsNullOrWhiteSpace(picked.bank)) banks.Add(picked.bank);
             }
             catch (Exception ex)
             {
