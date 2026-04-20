@@ -3,19 +3,18 @@
 	import { fade, fly, slide } from 'svelte/transition';
 	import { type LedgerEntry } from '$lib/api';
 	import { categoryColor, heatBucket, shortCategory } from '$lib/colors';
-	import { ledgerStore, loadLedger } from '$lib/appState';
+	import { ledgerStore, loadLedger, selectedMonth as selectedMonthStore } from '$lib/appState';
+	import { get } from 'svelte/store';
 
 	// ---------- state ----------
 	let entries = $state<LedgerEntry[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
-	let ready = $state(false);
 
 	const unsub = ledgerStore.subscribe((s) => {
 		entries = s.entries;
 		loading = s.loading;
 		error = s.error;
-		if (s.loaded) ready = true;
 	});
 
 	type ViewMode = 'month' | 'week';
@@ -44,14 +43,34 @@
 
 	onMount(() => {
 		(async () => {
-			try {
-				await loadLedger();
-			} finally {
+			await loadLedger();
+			if (!anchor) {
+				const stored = get(selectedMonthStore);
+				if (stored) {
+					const [y, m] = stored.split('-').map((n) => parseInt(n, 10));
+					if (!isNaN(y) && !isNaN(m)) anchor = new Date(y, m - 1, 1);
+				}
 				if (!anchor) anchor = latestDataDate() ?? startOfDay(new Date());
-				ready = true;
 			}
 		})();
-		return () => unsub();
+		return () => { unsub(); unsubMonth(); };
+	});
+
+	// Keep shared month store in sync whenever anchor changes (month view or week view).
+	$effect(() => {
+		if (!anchor) return;
+		const ym = `${anchor.getFullYear()}-${pad(anchor.getMonth() + 1)}`;
+		if (get(selectedMonthStore) !== ym) selectedMonthStore.set(ym);
+	});
+
+	// React to external changes from other pages (e.g. dashboard switched month).
+	const unsubMonth = selectedMonthStore.subscribe((v) => {
+		if (!v) return;
+		const [y, m] = v.split('-').map((n) => parseInt(n, 10));
+		if (isNaN(y) || isNaN(m)) return;
+		if (!anchor || anchor.getFullYear() !== y || anchor.getMonth() !== m - 1) {
+			anchor = new Date(y, m - 1, 1);
+		}
 	});
 
 	// Lock body scroll when a day is selected.
@@ -431,7 +450,7 @@
 						{/if}
 						<div class="cell-day">{dayOfMonth(c.date)}</div>
 						{#if c.spend > 0}
-							<div class="cell-amt">${fmt0(c.spend)}</div>
+							<div class="cell-amt" class:big={c.spend >= 1000} class:xbig={c.spend >= 10000}>${fmt0(c.spend)}</div>
 						{:else}
 							<div class="cell-amt muted">—</div>
 						{/if}
@@ -783,7 +802,7 @@
 
 	.cal-grid {
 		display: grid;
-		grid-template-columns: repeat(7, 1fr);
+		grid-template-columns: repeat(7, minmax(0, 1fr));
 		gap: 4px;
 	}
 	.cal-grid.week-mode {
@@ -832,6 +851,16 @@
 		font-variant-numeric: tabular-nums;
 		align-self: flex-end;
 		color: #1e293b;
+		max-width: 100%;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.cell-amt.big {
+		font-size: 0.6rem;
+	}
+	.cell-amt.xbig {
+		font-size: 0.52rem;
 	}
 	.cell-amt.muted {
 		color: #cbd5e1;

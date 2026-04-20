@@ -22,10 +22,19 @@ public class SpendingAnalyzerService
     private static readonly string[] SpendingCategories =
     [
         "Groceries", "Eat Out", "Transport",
-        "Shopping", "Entertainment", "Subscription", "Utilities",
+        "Shopping", "Entertainment", "Subscription",
         "Health", "Travel", "Personal",
-        "Education", "Maintenance", "Cash", "Other"
+        "Education", "Maintenance", "Cash", "Bills", "Other"
     ];
+
+    // Non-discretionary categories — tracked and displayed, but excluded from
+    // the "what you spent daily" totals, donut, and fun stats. Pocket CPA is
+    // a discretionary-spending coach; rent, utilities, insurance, and loan
+    // payments just muddy the signal.
+    private static readonly HashSet<string> NonDiscretionaryCategories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Bills"
+    };
 
     private static readonly string SystemPrompt = $$"""
         You extract transactions from raw bank or credit-card statement text (Chase, American Express,
@@ -53,14 +62,30 @@ public class SpendingAnalyzerService
         For each transaction, decide:
           - PURCHASE: a merchant charge (spending). Return the amount as POSITIVE.
           - REFUND / RETURN / MERCHANT CREDIT: a negative amount clearly tied to a merchant
-            ("RETURN WAL-MART", "AMAZON.COM REFUND", "LG ELECTRONICS ... -271.71"). Return the amount
-            as NEGATIVE. Do NOT drop these — the backend will subtract them from that merchant's category.
+            ("RETURN WAL-MART", "AMAZON.COM REFUND", "AMAZON MKTPLACE PMTS ... -17.89",
+            "LG ELECTRONICS ... -271.71"). Return the amount as NEGATIVE. Do NOT drop these —
+            the backend uses them to cancel out the matching original purchase.
+            IMPORTANT: On Chase Amazon (Prime Visa) statements, the "PAYMENTS AND OTHER CREDITS"
+            section contains BOTH card payments AND merchant refunds. Any row whose merchant is
+            "AMAZON MKTPLACE PMTS" or "AMAZON.COM" (with negative amount) is a REFUND — you MUST
+            include it as a NEGATIVE transaction, even though it sits in that section. Only the
+            "Payment Thank You", "AUTOPAY", or generic card-payment rows get skipped.
           - SKIP entirely (do not include in the output):
-              * Payments / autopay / "Thank You" payments
-              * Balance transfers, cash advances treated as payments
-              * Deposits, payroll, transfers from other accounts
-              * Rewards redemptions, cashback credits, interest PAID to you
-              * Statement summaries, running balances, section totals
+              * Card payments to the issuer: "Payment Thank You", "AUTOPAY", "PAYMENT - THANK YOU",
+                "PAYMENT RECEIVED", "ONLINE PAYMENT", "MOBILE PAYMENT".
+              * Balance transfers, cash advances treated as payments.
+              * Deposits, payroll, transfers from other accounts.
+              * Rewards redemptions, cashback credits, interest PAID to you, "SHOP WITH POINTS"
+                rewards-redemption rows (Chase Amazon "Shop with Points" section).
+              * Statement summaries, running balances, section totals.
+              * Foreign-currency exchange-rate detail lines. Chase and other issuers follow every
+                international charge with a sub-line like:
+                    "WON   17,300 X 0.000721965 (EXCHG RATE)"
+                    "EUR       25.50 X 1.086234 (EXCHG RATE)"
+                These are NOT transactions — they are annotations for the USD charge immediately
+                above them. The real merchant row (with its USD amount) is already in the list, so
+                SKIP any row whose description contains "(EXCHG RATE)" or "EXCHG RATE" regardless
+                of the amount shown.
               * For CHECKING accounts: any POSITIVE amount is a deposit — SKIP.
 
         # Step 3: Output
@@ -75,7 +100,10 @@ public class SpendingAnalyzerService
                          "OPENAI *CHATGPT SUBSCR OPENAI.COM CA" → "ChatGPT"
                          "NTTA CSC - PLANO 972-818-6882 TX"   → "NTTA Tolls"
                          "CHECKCARD 1218 WALMART GROCERY"     → "Walmart"
-          description: the original row text, unchanged (for reference).
+          description: the original row text, unchanged (for reference). IF the next line in the
+                       statement shows an "Order Number" (common on Chase Amazon statements),
+                       append it verbatim so refunds can be matched back to their purchases.
+                       Example: "AMAZON MKTPLACE PMTS Amzn.com/bill WA Order Number 111-3992656-4285019"
           amount:      dollars and cents. POSITIVE for purchases. NEGATIVE for refunds/returns.
           category:    EXACTLY one of: {{string.Join(", ", SpendingCategories)}}
 
@@ -92,9 +120,20 @@ public class SpendingAnalyzerService
         - Entertainment: movies, concerts, events, games, streaming rentals, Xbox/PlayStation purchases,
           gaming, ticket purchases.
         - Subscription: recurring monthly/yearly subscriptions like Spotify, Netflix, Hulu, Disney+,
-          Apple.com/Bill, ChatGPT, Tesla Subscription, Audible, YouTube Premium, iCloud.
-        - Utilities: AT&T, Verizon, T-Mobile, Comcast, Spectrum, electric/gas/water, USAA Insurance,
-          Progressive, Geico, State Farm.
+          Apple.com/Bill, ChatGPT, Tesla Subscription, Audible, YouTube Premium, iCloud. Also small
+          retail protection / warranty / membership fees (Storeplan, Asurion, SquareTrade, AppleCare,
+          Costco Membership, Amazon Prime, Sam's Club) — these are optional subscriptions, NOT bills.
+        - Bills (NON-DISCRETIONARY, tracked but excluded from daily-spending totals): ONLY real
+          life-expense payments. Use this category STRICTLY for:
+            * Utility providers — electric / gas / water / sewer / trash companies, Comcast/Xfinity,
+              Spectrum, Cox, Fios, AT&T Fiber, cellular carriers (AT&T, Verizon, T-Mobile, Mint, Visible).
+            * Insurance carriers — USAA, Progressive, Geico, State Farm, Allstate, Liberty Mutual,
+              Farmers, Nationwide, health insurance premiums.
+            * Rent / mortgage / HOA / property-management companies.
+            * Auto-loan payments, student-loan servicers (Nelnet, Sallie Mae, Navient, MOHELA, AES),
+              explicit loan-payment rows.
+          DO NOT put small retail protection plans, warranty add-ons, memberships, or anything you're
+          uncertain about into Bills — when in doubt, use Subscription or the merchant's natural category.
         - Health: CVS, Walgreens, doctor offices, hospitals, labs, dental.
         - Travel: Airbnb, Booking.com, Expedia, Marriott, Hilton, airline tickets, Super.com *Hotels.
         - Personal: salons, spas, barbershops, gyms, Planet Fitness.
@@ -111,15 +150,38 @@ public class SpendingAnalyzerService
         - If no dates exist and no hint is given, return "".
 
         # Bank detection
-        Return the issuer name found in the statement header/letterhead in the `bank` field.
-        Use the canonical short name: "Chase", "American Express", "Bank of America", "Capital One",
-        "Discover", "Citi", "Wells Fargo", "USAA", "U.S. Bank", "Apple Card", "PayPal". If you cannot
-        identify it confidently, return "" (empty string).
+        Return the card-product name (co-brand aware) in the `bank` field so different cards from
+        the same issuer don't collide. Look at the statement header, the card name on page 1, any
+        "ACCOUNT ENDING IN XXXX" block, or reward-program branding.
+
+        Canonical labels to use when the product is identifiable:
+          - Chase cards: "Chase Sapphire", "Chase Freedom", "Chase Freedom Unlimited",
+            "Chase Amazon" (Amazon Prime Visa), "Chase Ink", "Chase United", "Chase Southwest",
+            "Chase Marriott", "Chase Hyatt", "Chase Disney". If only "Chase" is visible with
+            no product branding, return "Chase".
+          - American Express: "Amex Gold", "Amex Platinum", "Amex Green", "Amex Blue Cash",
+            "Amex Delta", "Amex Hilton", "Amex Marriott". Otherwise "American Express".
+          - Capital One: "Capital One Venture", "Capital One Quicksilver", "Capital One Savor",
+            "Capital One Walmart". Otherwise "Capital One".
+          - Citi: "Citi Double Cash", "Citi Costco", "Citi Premier", "Citi AAdvantage". Otherwise "Citi".
+          - Discover: "Discover it". Otherwise "Discover".
+          - Others: "Bank of America", "Wells Fargo", "USAA", "U.S. Bank", "Apple Card", "PayPal".
+
+        If you cannot identify the product confidently, return the issuer short name alone.
+        If you cannot identify the issuer at all, return "" (empty string).
 
         # Absolute rules
         - Extract EVERY transaction. Do not skip rows to save effort. Large statements may have 50-200 rows.
         - Do NOT invent transactions; only use rows literally present in the input.
         - Do NOT output the same row twice.
+        - NEVER output a transaction from marketing/rewards copy. Red flags: merchant is a single
+          generic verb/noun like "WON", "EARNED", "BONUS", "CONGRATULATIONS", "POINTS"; the row
+          lives in a "You've earned / you've won / rewards summary / sapphire preferred benefits"
+          block; the amount is suspiciously round (e.g., exactly 60000 points worth $600, or a
+          five/six-digit dollar amount on a consumer card). When in doubt, SKIP.
+        - No single consumer-card transaction exceeds ~$10,000. If you're about to output an
+          amount ≥ $10,000, it is almost certainly a balance, points total, or marketing line —
+          do NOT output it.
         - Sign discipline: if the original row shows a leading "-" or the issuer marks it as a credit/return,
           you MUST output a NEGATIVE amount. Sign-flipping a single refund can shift the user's total by
           hundreds of dollars and is the #1 source of incorrect totals.
@@ -227,6 +289,65 @@ public class SpendingAnalyzerService
                 duplicatesRemoved++;
         }
 
+        // Sanity guard: a consumer credit-card charge of >= $10,000 is almost
+        // always an AI hallucination — typically marketing text ("YOU'VE WON 60,000
+        // POINTS") or a balance/summary row misread as a transaction. Drop these
+        // before any aggregation so a single bad row can't nuke a whole month.
+        //
+        // Also drop phantom "currency-only" rows where the merchant name itself
+        // is literally a currency code ("WON", "EUR", "JPY", etc.). These come
+        // from Chase's exchange-rate sub-lines ("WON 17,300 X 0.000721965 EXCHG RATE")
+        // that the AI occasionally parses as separate transactions. We match only
+        // on the merchant field (not description) because the description of a
+        // REAL international purchase often ALSO contains "EXCHG RATE" sub-line text.
+        const decimal SingleTxCap = 10_000m;
+        var currencyOnlyMerchants = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "WON", "KRW", "EUR", "EURO", "JPY", "YEN", "GBP", "CNY", "RMB",
+            "HKD", "TWD", "THB", "INR", "SGD", "AUD", "CAD", "MXN", "BRL",
+            "CHF", "SEK", "NOK", "DKK", "PLN", "TRY", "ZAR", "AED", "IDR", "VND", "PHP"
+        };
+        int droppedOversized = 0;
+        int droppedFxLine = 0;
+        var guarded = new List<AiFlatTx>(unique.Count);
+        foreach (var t in unique)
+        {
+            var merchantTrim = (t.merchant ?? string.Empty).Trim();
+            if (currencyOnlyMerchants.Contains(merchantTrim))
+            {
+                droppedFxLine++;
+                _logger.LogWarning(
+                    "Dropping currency-only phantom row: merchant=\"{Merchant}\" amount={Amount:N2} date={Date}",
+                    t.merchant, t.amount, t.date);
+                continue;
+            }
+            if (Math.Abs(t.amount) >= SingleTxCap)
+            {
+                droppedOversized++;
+                _logger.LogWarning(
+                    "Dropping oversized transaction as likely AI hallucination: merchant=\"{Merchant}\" amount={Amount:C2} date={Date} desc=\"{Desc}\"",
+                    t.merchant, t.amount, t.date, (t.description ?? "").Length > 80 ? t.description![..80] + "…" : t.description);
+                continue;
+            }
+            guarded.Add(t);
+        }
+        unique = guarded;
+
+        // Chase Amazon refund netting: group by Amazon Order Number and cancel matching
+        // purchases with refunds. A fully refunded order is dropped entirely (no longer
+        // shows in ledger / heatmap / fun stats). A partially refunded order keeps a
+        // single net positive transaction.
+        var detectedBankHint = detectedBanks
+            .GroupBy(b => b, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .Select(g => g.Key)
+            .FirstOrDefault() ?? string.Empty;
+        int refundsNetted = 0;
+        if (detectedBankHint.Contains("Amazon", StringComparison.OrdinalIgnoreCase))
+        {
+            (unique, refundsNetted) = NetAmazonRefunds(unique);
+        }
+
         // Group by category, sum deterministically. No trust in AI arithmetic.
         var grouped = unique
             .GroupBy(t => string.IsNullOrWhiteSpace(t.category) ? "Other" : t.category)
@@ -245,12 +366,31 @@ public class SpendingAnalyzerService
             .Where(c => c.Total > 0)
             .ToList();
 
-        var totalSpent = grouped.Sum(c => c.Total);
+        // Discretionary total — this is what the dashboard shows as "spending".
+        // Bills (rent, utilities, loan/insurance payments) are tracked in their
+        // own category but do NOT count toward daily spending totals or percentages.
+        var discretionary = grouped.Where(c => !NonDiscretionaryCategories.Contains(c.Name)).ToList();
+        var billsTotal = grouped.Where(c => NonDiscretionaryCategories.Contains(c.Name)).Sum(c => c.Total);
+        var totalSpent = discretionary.Sum(c => c.Total);
+
         foreach (var c in grouped)
         {
-            c.Percentage = totalSpent > 0 ? Math.Round(c.Total / totalSpent * 100m, 1) : 0;
+            // Percentage is relative to discretionary total so the donut math adds
+            // to 100%. Bills get 0% (they're shown separately on the dashboard).
+            if (NonDiscretionaryCategories.Contains(c.Name))
+            {
+                c.Percentage = 0;
+            }
+            else
+            {
+                c.Percentage = totalSpent > 0 ? Math.Round(c.Total / totalSpent * 100m, 1) : 0;
+            }
         }
-        grouped = grouped.OrderByDescending(c => c.Total).ToList();
+        // Discretionary sorted first (biggest to smallest), Bills always last.
+        grouped = grouped
+            .OrderBy(c => NonDiscretionaryCategories.Contains(c.Name) ? 1 : 0)
+            .ThenByDescending(c => c.Total)
+            .ToList();
 
         // Pick the month: user-provided > most common detected
         var finalMonth = !string.IsNullOrWhiteSpace(month)
@@ -275,19 +415,26 @@ public class SpendingAnalyzerService
         }
 
         _logger.LogInformation(
-            "AI extraction: statements={N}, month={Month}, bank={Bank}, rawTx={Raw}, duplicatesRemoved={Dupes}, keptTx={Kept}, categories={Cats}, totalSpent={Total}",
-            statements.Count, finalMonth, finalBank, rawCount, duplicatesRemoved, unique.Count, grouped.Count, totalSpent);
+            "AI extraction: statements={N}, month={Month}, bank={Bank}, rawTx={Raw}, duplicatesRemoved={Dupes}, oversizedDropped={Oversized}, fxLinesDropped={Fx}, keptTx={Kept}, categories={Cats}, totalSpent={Total}, billsTotal={Bills}, amazonRefundsNetted={Netted}",
+            statements.Count, finalMonth, finalBank, rawCount, duplicatesRemoved, droppedOversized, droppedFxLine, unique.Count, grouped.Count, totalSpent, billsTotal, refundsNetted);
 
         if (string.IsNullOrWhiteSpace(finalMonth))
             throw new MonthNotDeterminedException();
 
-        var funStats = BuildFunStats(unique, grouped, totalSpent);
+        // Fun stats should reflect discretionary spending only — hottest day,
+        // biggest purchase, top category, etc. all exclude Bills.
+        var discretionaryTxs = unique
+            .Where(t => !NonDiscretionaryCategories.Contains(
+                string.IsNullOrWhiteSpace(t.category) ? "Other" : t.category))
+            .ToList();
+        var funStats = BuildFunStats(discretionaryTxs, discretionary, totalSpent);
 
         return new Analysis
         {
             Month = finalMonth,
             Bank = finalBank,
             TotalSpent = totalSpent,
+            BillsTotal = billsTotal,
             Categories = grouped,
             Insights = allInsights.Distinct().Take(8).ToList(),
             Suggestions = allSuggestions.Distinct().Take(8).ToList(),
@@ -389,6 +536,70 @@ public class SpendingAnalyzerService
             statement.FileName, parsed.transactions.Count, parsed.month);
 
         return parsed;
+    }
+
+    // Amazon order-number extraction: Chase Amazon statements list the Order Number on the
+    // row immediately after the transaction, e.g. "Order Number 111-3992656-4285019". Both
+    // the original purchase and any refund share the same order number — we use that to net
+    // purchase + refund pairs into a single (possibly zero or positive) entry.
+    private static readonly System.Text.RegularExpressions.Regex OrderNumberRegex =
+        new(@"\b(?:Order\s*Number[:\s]*)?(\d{3}-\d{7}-\d{7})\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static (List<AiFlatTx> txs, int netted) NetAmazonRefunds(List<AiFlatTx> input)
+    {
+        var byOrder = new Dictionary<string, List<AiFlatTx>>();
+        var passthrough = new List<AiFlatTx>();
+        foreach (var t in input)
+        {
+            var m = OrderNumberRegex.Match(t.description ?? string.Empty);
+            if (!m.Success)
+            {
+                passthrough.Add(t);
+                continue;
+            }
+            var key = m.Groups[1].Value;
+            if (!byOrder.TryGetValue(key, out var list))
+            {
+                list = new List<AiFlatTx>();
+                byOrder[key] = list;
+            }
+            list.Add(t);
+        }
+
+        int netted = 0;
+        var outList = new List<AiFlatTx>(passthrough);
+        foreach (var kvp in byOrder)
+        {
+            var group = kvp.Value;
+            if (group.Count == 1)
+            {
+                outList.Add(group[0]);
+                continue;
+            }
+            // Multiple rows share this order number — at least one is a refund.
+            var net = group.Sum(t => t.amount);
+            netted++;
+            if (net <= 0.01m)
+            {
+                // Fully refunded (or net credit). Drop everything so it doesn't pollute
+                // ledger / heatmap / fun stats.
+                continue;
+            }
+            // Partial refund — keep a single merged entry with the NET amount. Prefer the
+            // original purchase row as the template (positive amount, original date/merchant).
+            var anchor = group.OrderByDescending(t => t.amount).First();
+            outList.Add(new AiFlatTx
+            {
+                date = anchor.date,
+                merchant = anchor.merchant,
+                description = anchor.description,
+                amount = Math.Round(net, 2),
+                category = anchor.category
+            });
+        }
+
+        return (outList, netted);
     }
 
     private static List<FunStat> BuildFunStats(List<AiFlatTx> txs, List<SpendingCategory> categories, decimal totalSpent)

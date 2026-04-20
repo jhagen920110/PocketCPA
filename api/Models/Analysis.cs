@@ -25,6 +25,9 @@ public class Analysis
     [JsonPropertyName("totalSpent")]
     public decimal TotalSpent { get; set; }
 
+    [JsonPropertyName("billsTotal")]
+    public decimal BillsTotal { get; set; }
+
     [JsonPropertyName("categories")]
     public List<SpendingCategory> Categories { get; set; } = [];
 

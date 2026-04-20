@@ -5,11 +5,11 @@
 	import UploadAndAnalyze from '$lib/components/UploadAndAnalyze.svelte';
 	import AnalysisResults from '$lib/components/AnalysisResults.svelte';
 	import PastAnalyses from '$lib/components/PastAnalyses.svelte';
-	import { isAnalyzing, analysesStore, loadAnalyses, upsertAnalysis, invalidateLedger } from '$lib/appState';
+	import { isAnalyzing, analysesStore, loadAnalyses, upsertAnalysis, invalidateLedger, selectedMonth as selectedMonthStore } from '$lib/appState';
+	import { get } from 'svelte/store';
 	import { shortCategory } from '$lib/colors';
 
 	let summaries = $state<AnalysisSummary[]>([]);
-	let ready = $state(false);
 	let uploadOpen = $state(false);
 	let pastOpen = $state(false);
 
@@ -22,8 +22,9 @@
 		summaries = s.summaries;
 		loadedAnalyses = s.analyses;
 		for (const a of s.analyses) cache.set(a.id, a);
-		if (s.loaded) ready = true;
 	});
+
+	const ready = $derived($analysesStore.loaded);
 
 	// ---------- Date parsing (re-used, matches Dashboard/Ledger) ----------
 	function parseTxnIso(dateStr: string, fallbackMonth: string): string | null {
@@ -78,7 +79,14 @@
 		return Array.from(set).sort().reverse();
 	});
 
-	let selectedMonth = $state<string | null>(null);
+	let selectedMonth = $state<string | null>(get(selectedMonthStore));
+
+	const unsubMonth = selectedMonthStore.subscribe((v) => {
+		if (v !== selectedMonth) selectedMonth = v;
+	});
+	$effect(() => {
+		if (selectedMonth !== get(selectedMonthStore)) selectedMonthStore.set(selectedMonth);
+	});
 
 	// Build a synthesized Analysis per (month, bank) by re-bucketing
 	// transactions into their actual calendar month.
@@ -261,10 +269,11 @@
 
 	onMount(async () => {
 		await loadAnalyses();
-		if (!selectedMonth && months.length > 0) selectedMonth = months[0];
-		ready = true;
+		if (months.length > 0 && (!selectedMonth || !months.includes(selectedMonth))) {
+			selectedMonth = months[0];
+		}
 	});
-	onDestroy(() => unsub());
+	onDestroy(() => { unsub(); unsubMonth(); });
 </script>
 
 {#if ready}

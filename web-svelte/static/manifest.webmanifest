@@ -1,13 +1,13 @@
 {
-	"name": "Spending Suggestion",
-	"short_name": "Spending",
+	"name": "Pocket CPA",
+	"short_name": "Pocket CPA",
 	"description": "AI-powered personal spending analyzer.",
 	"start_url": "/",
 	"scope": "/",
 	"display": "standalone",
 	"orientation": "portrait",
-	"background_color": "#059669",
-	"theme_color": "#059669",
+	"background_color": "#6ee7b7",
+	"theme_color": "#6ee7b7",
 	"icons": [
 		{
 			"src": "/icons/icon-192.png",

@@ -133,3 +133,17 @@ export function loadLedger(force = false): Promise<void> {
 export function invalidateLedger() {
 	ledgerStore.set({ entries: [], loaded: false, loading: false, error: null });
 }
+
+// ---------- Shared selected month (YYYY-MM) ----------
+// In-memory only — on fresh load, each page defaults to its own latest month.
+// While the app is open, changes sync across Dashboard / Analyze / Ledger.
+export const selectedMonth = writable<string | null>(null);
+
+// One-time cleanup: remove any legacy persisted value so we always default to latest.
+if (typeof localStorage !== 'undefined') {
+	try { localStorage.removeItem('ss.selectedMonth'); } catch {}
+}
+
+export function setSelectedMonth(m: string | null) {
+	selectedMonth.set(m);
+}

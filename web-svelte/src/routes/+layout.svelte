@@ -13,17 +13,17 @@
 	let nameDraft = $state('');
 
 	const SPLASH_MESSAGES = [
-		'🪙 Checking under the couch cushions…',
-		'🐷 Waking up the piggy bank…',
-		'💸 Counting every last penny…',
-		'🔎 Hunting for coins under the bed…',
-		'🧾 Dusting off old receipts…',
-		'☕ Skipping one latte, just in case…',
-		'🛒 Negotiating with your shopping cart…',
+		'🪙 Checking the couch cushions…',
+		'🐷 Waking the piggy bank…',
+		'💸 Counting every penny…',
+		'🔎 Hunting lost coins…',
+		'🧾 Dusting old receipts…',
+		'☕ Skipping a latte, just in case…',
+		'🛒 Negotiating with your cart…',
 		'📊 Teaching numbers to dance…',
-		'🍜 Pretending ramen is a vibe, not a budget…',
-		'🧠 Convincing your wallet to breathe…',
-		'✨ Sprinkling financial fairy dust…',
+		'🍜 Ramen is a vibe, right?',
+		'🧠 Coaching your wallet…',
+		'✨ Sprinkling fairy dust…',
 		'🐿️ Stashing nuts for winter…'
 	];
 	let splashIdx = $state(0);
@@ -32,7 +32,9 @@
 
 	$effect(() => {
 		if (!$userEmail) return;
-		if ($analysesStore.loaded && $ledgerStore.loaded) dataReady = true;
+		const a = $analysesStore;
+		const l = $ledgerStore;
+		if (a.loaded && !a.loading && l.loaded && !l.loading) dataReady = true;
 	});
 
 	$effect(() => {
@@ -129,7 +131,7 @@
 </script>
 
 <svelte:head>
-	<title>Spending Suggestion</title>
+	<title>Pocket CPA</title>
 </svelte:head>
 
 {#if showSplash}
@@ -140,7 +142,7 @@
 				<div class="coin coin-2">💰</div>
 				<div class="coin coin-3">✨</div>
 			</div>
-			<h1 class="splash-title">Spending Suggestion</h1>
+			<h1 class="splash-title">Pocket CPA</h1>
 			<div class="splash-msg-wrap">
 				{#key splashIdx}
 					<p class="splash-msg" in:fly={{ y: 8, duration: 280 }} out:fade={{ duration: 160 }}>
@@ -154,7 +156,7 @@
 
 {#if $userEmail}
 	<header class="top-bar">
-		<h1 class="top-bar-title">💰 Spending Suggestion</h1>
+		<h1 class="top-bar-title">💰 Pocket CPA</h1>
 		<div class="account-wrap">
 			<button
 				class="account-btn"
@@ -262,7 +264,7 @@
 {:else}
 	<div class="overlay">
 		<div class="card auth-card">
-			<h2>💰 Spending Suggestion</h2>
+			<h2>💰 Pocket CPA</h2>
 			<p>Upload your bank statements and get AI-powered spending analysis.</p>
 			<a href="/.auth/login/google" class="btn btn-primary google-btn">Sign in with Google</a>
 		</div>
@@ -279,6 +281,7 @@
 	:global(html) {
 		touch-action: manipulation;
 		-ms-content-zooming: none;
+		background: #6ee7b7;
 	}
 
 	:global(body) {
@@ -307,7 +310,7 @@
 		position: fixed;
 		inset: 0;
 		z-index: 9999;
-		background: linear-gradient(135deg, #059669 0%, #0d9488 50%, #0891b2 100%);
+		background: linear-gradient(180deg, #6ee7b7 0%, #34d399 45%, #0d9488 100%);
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -400,6 +403,7 @@
 		position: relative;
 		height: 28px;
 		margin-top: 14px;
+		width: min(92vw, 420px);
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -415,6 +419,9 @@
 		color: rgba(255, 255, 255, 0.92);
 		padding: 0 12px;
 		text-align: center;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.overlay {

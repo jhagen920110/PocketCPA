@@ -6,10 +6,10 @@
 	import CategoryBubbles from '$lib/components/CategoryBubbles.svelte';
 	import { categoryColor, shortCategory } from '$lib/colors';
 	import { userEmail, displayName } from '$lib/auth';
-	import { analysesStore, loadAnalyses } from '$lib/appState';
+	import { analysesStore, loadAnalyses, selectedMonth as selectedMonthStore } from '$lib/appState';
+	import { get } from 'svelte/store';
 
 	let summaries = $state<AnalysisSummary[]>([]);
-	let ready = $state(false);
 	let loading = $state(false);
 
 	// Once loaded, every analysis sits here keyed by id.
@@ -20,8 +20,9 @@
 		summaries = s.summaries;
 		loadedAnalyses = s.analyses;
 		loading = s.loading;
-		if (s.loaded) ready = true;
 	});
+
+	const ready = $derived($analysesStore.loaded);
 
 	// Build a global flat list of transactions (with their TRUE calendar ISO date)
 	// the very first time we see each analysis. Then the dashboard groups by the
@@ -64,7 +65,15 @@
 		return Array.from(set).sort().reverse();
 	});
 
-	let selectedMonth = $state<string | null>(null);
+	let selectedMonth = $state<string | null>(get(selectedMonthStore));
+
+	// Sync local state <-> shared store so switching pages preserves the month.
+	const unsubMonth = selectedMonthStore.subscribe((v) => {
+		if (v !== selectedMonth) selectedMonth = v;
+	});
+	$effect(() => {
+		if (selectedMonth !== get(selectedMonthStore)) selectedMonthStore.set(selectedMonth);
+	});
 
 	// Convenience: all insights/suggestions/fun-stats from analyses that
 	// *contributed any transaction* to the selected month. This keeps AI
@@ -245,14 +254,13 @@
 	}
 
 	onMount(async () => {
-		try {
-			await loadAnalyses();
-		} finally {
-			if (months.length > 0 && !selectedMonth) selectedMonth = months[0];
-			ready = true;
+		await loadAnalyses();
+		// If the stored month isn't present in this user's data, fall back to latest.
+		if (months.length > 0 && (!selectedMonth || !months.includes(selectedMonth))) {
+			selectedMonth = months[0];
 		}
 	});
-	onDestroy(() => unsub());
+	onDestroy(() => { unsub(); unsubMonth(); });
 
 	// ---------- Daily trend chart ----------
 	const CHART_W = 320;
