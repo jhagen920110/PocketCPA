@@ -227,6 +227,53 @@ public class SpendingAnalyzerService
         }
     }
 
+    // Extract one text string per PDF page so we can analyze large statements
+    // page-by-page when a single-shot call hits Azure's content filter or the
+    // token cap. Returns null for non-PDF content.
+    private List<string>? ExtractPages(string rawContent, string fileName)
+    {
+        const string prefix = "[PDF:base64]";
+        if (!rawContent.StartsWith(prefix)) return null;
+        try
+        {
+            var bytes = Convert.FromBase64String(rawContent.Substring(prefix.Length));
+            using var stream = new MemoryStream(bytes);
+            using var pdf = PdfDocument.Open(stream);
+            var pages = new List<string>();
+            foreach (var page in pdf.GetPages())
+                pages.Add(page.Text ?? string.Empty);
+            return pages;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to split PDF into pages for {File}", fileName);
+            return null;
+        }
+    }
+
+    // Group page texts into chunks that stay under a target char budget so each
+    // AI call is small enough to avoid content-filter truncation. Pages are
+    // never split (they're natural transaction-table boundaries).
+    private static List<string> PackPagesIntoChunks(List<string> pages, int maxCharsPerChunk)
+    {
+        var chunks = new List<string>();
+        var sb = new StringBuilder();
+        int pageNum = 0;
+        foreach (var page in pages)
+        {
+            pageNum++;
+            if (sb.Length > 0 && sb.Length + page.Length > maxCharsPerChunk)
+            {
+                chunks.Add(sb.ToString());
+                sb.Clear();
+            }
+            sb.AppendLine($"--- PAGE {pageNum} ---");
+            sb.AppendLine(page);
+        }
+        if (sb.Length > 0) chunks.Add(sb.ToString());
+        return chunks;
+    }
+
     // DTO the AI fills in. Flat list only — backend does all math.
     private class AiFlatResponse
     {
@@ -498,6 +545,62 @@ public class SpendingAnalyzerService
             "Verification MISMATCH for {File}: run1={Sum1:C2}/{N1}tx vs run2={Sum2:C2}/{N2}tx — running tiebreaker",
             statement.FileName, fp1.SumAbs, fp1.Count, fp2.SumAbs, fp2.Count);
 
+        // Before burning another single-shot call, try chunked mode — it's
+        // usually the real fix when runs disagree on a big statement (the
+        // single-shot call is truncating or content-filtering intermittently).
+        var pages = ExtractPages(statement.RawContent, statement.FileName);
+        if (pages != null && pages.Count >= 2)
+        {
+            try
+            {
+                var chunked = await ExtractFromChunksAsync(statement, pages, month);
+                var fpC = Fingerprint(chunked);
+                _logger.LogInformation(
+                    "Chunked tiebreaker for {File}: {Sum:C2}/{N}tx",
+                    statement.FileName, fpC.SumAbs, fpC.Count);
+
+                // Prefer chunked if it returned MORE transactions than both runs
+                // (chunked extraction misses less of the statement). Otherwise
+                // use chunked as a 3rd vote: pick whichever pair agrees.
+                if (fpC.Count > fp1.Count && fpC.Count > fp2.Count)
+                {
+                    _logger.LogInformation(
+                        "Verification resolved for {File} via chunked (more tx than either run)",
+                        statement.FileName);
+                    return chunked;
+                }
+                if (Agree(fpC, fp1) && Agree(fpC, fp2))
+                {
+                    _logger.LogInformation(
+                        "Verification resolved for {File}: all 3 sources agree",
+                        statement.FileName);
+                    return fp1.Count >= fp2.Count ? run1 : run2;
+                }
+                if (Agree(fpC, fp1))
+                {
+                    _logger.LogInformation(
+                        "Verification resolved for {File} via chunked+run1",
+                        statement.FileName);
+                    return fpC.Count >= fp1.Count ? chunked : run1;
+                }
+                if (Agree(fpC, fp2))
+                {
+                    _logger.LogInformation(
+                        "Verification resolved for {File} via chunked+run2",
+                        statement.FileName);
+                    return fpC.Count >= fp2.Count ? chunked : run2;
+                }
+                // Chunked disagreed with both — fall through to the normal
+                // tiebreaker (run3) as a last resort.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Chunked tiebreaker failed for {File}; falling back to run3",
+                    statement.FileName);
+            }
+        }
+
         AiFlatResponse? run3 = null;
         (decimal SumAbs, int Count)? fp3 = null;
         try
@@ -550,12 +653,107 @@ public class SpendingAnalyzerService
 
     private async Task<AiFlatResponse> ExtractFromOneAsync(Statement statement, string? month)
     {
-        var url = $"{_options.Endpoint}/openai/v1/chat/completions";
+        // First attempt: send the whole statement in a single AI call. This is
+        // fast and works for ~98% of statements (1-page and small 2-page ones).
         var stmtText = PrepareContent(statement.RawContent, statement.FileName);
-
         var userMessage = !string.IsNullOrEmpty(month)
             ? $"Extract transactions from the following bank/credit-card statement for the month of {month}. Only include transactions from that month.\n\n--- {statement.FileName} ---\n{stmtText}"
             : $"Extract transactions from the following bank/credit-card statement. Determine the month from the statement's closing/transaction dates.\n\n--- {statement.FileName} ---\n{stmtText}";
+
+        var (parsed, finishReason, recovered) = await CallAiAsync(userMessage, statement.FileName);
+
+        // Fallback: if Azure's content filter truncated us, or we had to
+        // salvage JSON, or the model hit max_completion_tokens, re-run the
+        // statement in per-page chunks so each call stays small enough to
+        // avoid both truncation and the content filter.
+        bool needsChunked =
+            finishReason == "content_filter" ||
+            finishReason == "length" ||
+            recovered;
+
+        if (needsChunked)
+        {
+            var pages = ExtractPages(statement.RawContent, statement.FileName);
+            if (pages != null && pages.Count >= 2)
+            {
+                _logger.LogWarning(
+                    "Single-shot extraction unreliable for {File} (finish={FR}, recovered={Rec}); falling back to chunked mode over {Pages} pages",
+                    statement.FileName, finishReason ?? "null", recovered, pages.Count);
+                var chunked = await ExtractFromChunksAsync(statement, pages, month);
+                if (chunked.transactions.Count > parsed.transactions.Count)
+                {
+                    return chunked;
+                }
+                _logger.LogInformation(
+                    "Chunked mode returned fewer tx ({Chunked}) than single-shot ({Single}) for {File}; keeping single-shot",
+                    chunked.transactions.Count, parsed.transactions.Count, statement.FileName);
+            }
+        }
+
+        _logger.LogInformation(
+            "Per-statement extraction: file={File}, tx={Tx}, month={Month}",
+            statement.FileName, parsed.transactions.Count, parsed.month);
+        return parsed;
+    }
+
+    // Split the statement into page-range chunks (each chunk ~6k chars of PDF
+    // text, roughly 30-60 transactions) and analyze each chunk independently.
+    // The chunks are then merged: union all transactions, vote on month/bank.
+    // Each chunk uses the same strict system prompt; the user message tells
+    // the model it's analyzing only part of the statement.
+    private async Task<AiFlatResponse> ExtractFromChunksAsync(Statement statement, List<string> pages, string? month)
+    {
+        const int MaxCharsPerChunk = 6000;
+        var chunks = PackPagesIntoChunks(pages, MaxCharsPerChunk);
+        _logger.LogInformation(
+            "Chunked extraction for {File}: {Pages} pages → {Chunks} chunks",
+            statement.FileName, pages.Count, chunks.Count);
+
+        var merged = new AiFlatResponse();
+        var months = new List<string>();
+        var banks = new List<string>();
+
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            var chunkMsg = !string.IsNullOrEmpty(month)
+                ? $"This is PART {c + 1} of {chunks.Count} of the statement '{statement.FileName}' for the month of {month}. Extract ONLY the transactions visible in this part; other parts of the statement will be processed separately. Do not skip transactions to avoid double-counting — the backend handles deduplication.\n\n{chunks[c]}"
+                : $"This is PART {c + 1} of {chunks.Count} of the statement '{statement.FileName}'. Extract ONLY the transactions visible in this part; other parts of the statement will be processed separately. Do not skip transactions to avoid double-counting — the backend handles deduplication. Still return the statement's month/bank from any header info in this part (empty string if not visible here).\n\n{chunks[c]}";
+
+            try
+            {
+                var (chunkParsed, chunkFinish, chunkRecovered) = await CallAiAsync(chunkMsg, $"{statement.FileName}[part{c + 1}/{chunks.Count}]");
+                merged.transactions.AddRange(chunkParsed.transactions);
+                if (chunkParsed.insights != null) merged.insights.AddRange(chunkParsed.insights);
+                if (chunkParsed.suggestions != null) merged.suggestions.AddRange(chunkParsed.suggestions);
+                if (!string.IsNullOrWhiteSpace(chunkParsed.month)) months.Add(chunkParsed.month);
+                if (!string.IsNullOrWhiteSpace(chunkParsed.bank)) banks.Add(chunkParsed.bank);
+                _logger.LogInformation(
+                    "Chunk {N}/{Total} of {File}: tx={Tx} finish={FR} recovered={Rec}",
+                    c + 1, chunks.Count, statement.FileName, chunkParsed.transactions.Count,
+                    chunkFinish ?? "null", chunkRecovered);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Chunk {N}/{Total} failed for {File}; continuing with remaining chunks",
+                    c + 1, chunks.Count, statement.FileName);
+            }
+        }
+
+        // Vote on month/bank across chunks (most common non-empty wins).
+        merged.month = months.GroupBy(m => m).OrderByDescending(g => g.Count())
+            .Select(g => g.Key).FirstOrDefault() ?? string.Empty;
+        merged.bank = banks.GroupBy(b => b, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault() ?? string.Empty;
+        return merged;
+    }
+
+    // Low-level AI call. Returns the parsed response (possibly recovered from
+    // truncation), the AI's finish_reason, and whether recovery was needed.
+    // Throws only on network/HTTP errors — mid-JSON truncation is recovered.
+    private async Task<(AiFlatResponse Parsed, string? FinishReason, bool Recovered)> CallAiAsync(string userMessage, string fileNameForLogging)
+    {
+        var url = $"{_options.Endpoint}/openai/v1/chat/completions";
 
         var requestBody = new
         {
@@ -626,7 +824,7 @@ public class SpendingAnalyzerService
         var responseBody = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
-            throw new Exception($"AI request failed for {statement.FileName} ({response.StatusCode}): {responseBody}");
+            throw new Exception($"AI request failed for {fileNameForLogging} ({response.StatusCode}): {responseBody}");
 
         using var doc = JsonDocument.Parse(responseBody);
         var choice = doc.RootElement.GetProperty("choices")[0];
@@ -634,6 +832,7 @@ public class SpendingAnalyzerService
         var finishReason = choice.TryGetProperty("finish_reason", out var fr) ? fr.GetString() : null;
 
         AiFlatResponse? parsed = null;
+        bool recovered = false;
         try
         {
             parsed = JsonSerializer.Deserialize<AiFlatResponse>(content!,
@@ -641,24 +840,18 @@ public class SpendingAnalyzerService
         }
         catch (JsonException jex)
         {
-            // Response was truncated mid-array (usually finish_reason="length" on
-            // very large statements). Recover whatever transactions we got by
-            // closing the JSON at the last complete transaction, so we keep ~150
-            // good txs instead of losing the entire statement.
+            // Truncated mid-array (content_filter or length). Recover what we can.
             _logger.LogWarning(jex,
                 "Truncated AI JSON for {File} (finish_reason={FR}); attempting recovery",
-                statement.FileName, finishReason ?? "null");
-            parsed = TryRecoverTruncatedJson(content!, statement.FileName);
+                fileNameForLogging, finishReason ?? "null");
+            parsed = TryRecoverTruncatedJson(content!, fileNameForLogging);
+            recovered = parsed != null;
         }
 
         if (parsed == null)
-            throw new Exception($"Failed to parse AI response for {statement.FileName} (finish_reason={finishReason}).");
+            throw new Exception($"Failed to parse AI response for {fileNameForLogging} (finish_reason={finishReason}).");
 
-        _logger.LogInformation(
-            "Per-statement extraction: file={File}, tx={Tx}, month={Month}",
-            statement.FileName, parsed.transactions.Count, parsed.month);
-
-        return parsed;
+        return (parsed, finishReason, recovered);
     }
 
     // Amazon order-number extraction: Chase Amazon statements list the Order Number on the
