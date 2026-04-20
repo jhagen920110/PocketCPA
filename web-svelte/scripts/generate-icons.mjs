@@ -39,26 +39,81 @@ async function gradientCanvas(size) {
 	return sharp(gradientSvg(size)).png().toBuffer();
 }
 
+// Lazily produce a version of the source icon with the outer background
+// removed via corner flood-fill. The source PNG has a faint vignette around
+// the book that defeats plain `.trim()`, and chroma-keying white would also
+// erase the book's interior pages. Flood-filling from the corners only
+// targets the connected exterior region.
+let _cutout = null;
+async function getCutoutIcon() {
+	if (_cutout) return _cutout;
+	const { data, info } = await sharp(SRC)
+		.ensureAlpha()
+		.raw()
+		.toBuffer({ resolveWithObject: true });
+	const { width: w, height: h, channels } = info;
+	const buf = Buffer.from(data); // mutable copy
+	const visited = new Uint8Array(w * h);
+	const stack = [];
+
+	// Sample the average corner color as the "background" reference.
+	const sampleAt = (x, y) => {
+		const i = (y * w + x) * channels;
+		return [buf[i], buf[i + 1], buf[i + 2]];
+	};
+	const corners = [sampleAt(0, 0), sampleAt(w - 1, 0), sampleAt(0, h - 1), sampleAt(w - 1, h - 1)];
+	const ref = [0, 1, 2].map((c) => corners.reduce((a, p) => a + p[c], 0) / corners.length);
+
+	// Generous tolerance — we want to fill the faint vignette too, but not
+	// the book. The book frame is a saturated blue-gray, well outside this
+	// distance from near-white.
+	const TOL = 55;
+	const near = (i) => {
+		const dr = buf[i] - ref[0];
+		const dg = buf[i + 1] - ref[1];
+		const db = buf[i + 2] - ref[2];
+		return dr * dr + dg * dg + db * db <= TOL * TOL;
+	};
+
+	const push = (x, y) => {
+		if (x < 0 || y < 0 || x >= w || y >= h) return;
+		const p = y * w + x;
+		if (visited[p]) return;
+		const i = p * channels;
+		if (!near(i)) return;
+		visited[p] = 1;
+		buf[i + 3] = 0; // transparent
+		stack.push(x, y);
+	};
+
+	for (const [sx, sy] of [
+		[0, 0],
+		[w - 1, 0],
+		[0, h - 1],
+		[w - 1, h - 1]
+	]) {
+		push(sx, sy);
+	}
+	while (stack.length) {
+		const y = stack.pop();
+		const x = stack.pop();
+		push(x + 1, y);
+		push(x - 1, y);
+		push(x, y + 1);
+		push(x, y - 1);
+	}
+
+	_cutout = await sharp(buf, { raw: { width: w, height: h, channels } }).png().toBuffer();
+	return _cutout;
+}
+
 async function makeFlat(size, outName, pad = 0.12, withGradient = false) {
 	const inner = Math.round(size * (1 - pad * 2));
-	const radius = Math.round(inner * 0.18); // iOS-style squircle corners
+	const src = withGradient ? await getCutoutIcon() : SRC;
 
-	// Render the source icon at inner size...
-	const iconRaw = await sharp(SRC)
+	const icon = await sharp(src)
 		.resize(inner, inner, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
 		.toBuffer();
-
-	// ...then mask it with a rounded rect so the base PNG's white background
-	// reads as a polished card rather than a hard square.
-	const mask = Buffer.from(
-		`<svg xmlns="http://www.w3.org/2000/svg" width="${inner}" height="${inner}"><rect width="${inner}" height="${inner}" rx="${radius}" ry="${radius}" fill="#fff"/></svg>`
-	);
-	const icon = withGradient
-		? await sharp(iconRaw)
-				.composite([{ input: mask, blend: 'dest-in' }])
-				.png()
-				.toBuffer()
-		: iconRaw;
 
 	const base = withGradient
 		? sharp(await gradientCanvas(size))
